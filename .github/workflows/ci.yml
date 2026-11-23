@@ -4,11 +4,43 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The Release workflow runs this before publishing.
+  workflow_call:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files need gofmt -w:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go mod tidy
+        run: go mod tidy -diff
+      - name: go vet
+        run: go vet ./...
+      - name: shellcheck
+        run: shellcheck -x install.sh scripts/*.sh scripts/lib/*.sh packaging/scripts/*.sh
+      - name: Release scripts self-test
+        run: scripts/check-release-tag.sh --selftest
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+
   test:
     strategy:
       fail-fast: false
@@ -20,12 +52,12 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - name: Vet
-        run: go vet ./...
       - name: Test
-        run: go test -race ./...
+        run: go test -race -count=1 ./...
 
-  release-config:
+  # Builds every release artifact (archives, .deb, .rpm) without publishing,
+  # so packaging problems show up before a release is tagged.
+  package:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -34,6 +66,10 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: check
       - uses: goreleaser/goreleaser-action@v6
         with:
           version: "~> v2"

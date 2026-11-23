@@ -439,19 +439,83 @@ devices through syncing, merging, conflicts (including modify/delete),
 restores, history-rewrite protection, device revocation, and live syncing
 via the daemon.
 
+### Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push
+to `main` and on every pull request. It runs three jobs:
+
+- **lint**: `gofmt`, `go mod tidy`, `go vet`, `shellcheck` on all shell
+  scripts, the release scripts' self-test, and
+  [govulncheck](https://go.dev/blog/govulncheck) for known vulnerabilities
+  in the code paths actually used.
+- **test**: `go test -race` on Linux and macOS.
+- **package**: `goreleaser check`, plus a full snapshot build of every
+  release artifact, so packaging problems show up before you tag.
+
+`go.mod` pins a patched Go toolchain (`toolchain go1.26.11`), and the go
+command downloads it automatically if yours is older. When govulncheck
+reports a standard-library issue, raise that line to the fixed version.
+
 ### Releasing
 
-Releases are built by [GoReleaser](https://goreleaser.com) from
-[`.goreleaser.yaml`](.goreleaser.yaml). It produces tarballs, `.deb` and
-`.rpm` packages, and checksums. Push a tag and the `Release` workflow
-publishes them on GitHub:
+Versions follow [semantic versioning](https://semver.org): `vMAJOR.MINOR.PATCH`,
+and `vX.Y.Z-rc.N` for prereleases. Cut a release with
+[`scripts/release.sh`](scripts/release.sh):
 
 ```sh
-git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0
+git push origin main          # wait for CI to pass
+scripts/release.sh            # or: patch | minor | major | 1.4.0 | minor --pre rc
 ```
 
-Test a release locally with `goreleaser release --snapshot --clean`. The
-output goes to `dist/`.
+The script:
+
+1. Checks you're on an up-to-date, clean `main`.
+2. Picks the next version. Without an argument it suggests one from the
+   commits since the last release:
+   - **major** for a breaking change: `feat!:` style, or `BREAKING CHANGE`
+     in a commit body. Before 1.0.0 this becomes **minor**, as semver
+     allows for 0.x.
+   - **minor** if anything was added.
+   - **patch** otherwise.
+
+   `--pre rc` makes `v1.3.0-rc.1`, then `rc.2` on the next run.
+3. Drafts release notes from those commits, grouped as Breaking changes,
+   New, Fixes, Changes and Documentation, each with its commit hash and a
+   full-changelog link. Commits starting with "Add …", "Fix …" and so on
+   are grouped automatically, as are Conventional Commit prefixes
+   (`feat:`, `fix:`, …). Maintenance commits (`chore:`, `ci:`, `test:`,
+   `refactor:`) are left out.
+4. Opens the draft in `$VISUAL` or `$EDITOR`. Reword it, add a summary,
+   or reorder it: **what you save is the release text on GitHub**. Save an
+   empty file to abort. An aborted draft is kept in
+   `.git/RELEASE_NOTES_<version>.md` and reused next time.
+5. Creates an **annotated** tag whose message holds the notes, and checks
+   it with [`scripts/check-release-tag.sh`](scripts/check-release-tag.sh).
+6. Asks, then pushes the tag.
+
+Useful options: `--dry-run` (show the version and the draft, change
+nothing), `--no-edit`, `--no-push`, `-y`.
+
+Pushing a `v*` tag starts
+[`.github/workflows/release.yml`](.github/workflows/release.yml):
+
+1. **validate** runs `check-release-tag.sh` again, so a tag pushed by hand
+   gets the same checks. The tag must be strict semver, annotated, with
+   notes, on `main`, and higher than every earlier tag.
+2. **ci** runs the whole CI workflow above against the tagged commit.
+3. **publish** runs GoReleaser. It builds the archives, `.deb` and `.rpm`
+   packages and checksums, and creates the GitHub release named
+   `dropgitbox vX.Y.Z`. The tag's notes are the body, with install
+   instructions appended. `-rc` and other prerelease versions are marked
+   as prereleases.
+
+Nothing is published unless all three pass. If a release goes wrong,
+delete the GitHub release and the tag (`git push origin :refs/tags/vX.Y.Z`
+and `git tag -d vX.Y.Z`), fix the problem, and release again. Use a new
+patch version if anyone may already have downloaded it.
+
+To try the packaging locally, run `goreleaser release --snapshot --clean`.
+The output goes to `dist/`.
 
 ## Known limitations
 

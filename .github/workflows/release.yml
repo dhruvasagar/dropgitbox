@@ -1,19 +1,48 @@
 name: Release
 
+# Cut a release with scripts/release.sh, which pushes an annotated vX.Y.Z
+# tag whose message is the release notes. This workflow then checks the
+# tag, runs CI, and publishes the GitHub release.
 on:
   push:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
-  release:
+  validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+      # actions/checkout can leave the pushed tag without its annotation;
+      # refetch so the tag message (the release notes) is available.
+      - name: Fetch tags
+        run: git fetch --force --tags
+      - name: Check the tag
+        run: scripts/check-release-tag.sh "$GITHUB_REF_NAME"
+
+  ci:
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Fetch tags
+        run: git fetch --force --tags
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod

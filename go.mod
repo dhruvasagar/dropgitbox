@@ -2,6 +2,8 @@ module github.com/dhruvasagar/dropgitbox
 
 go 1.26.2
 
+toolchain go1.26.11
+
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/fsnotify/fsnotify v1.10.1

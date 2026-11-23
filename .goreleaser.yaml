@@ -1,6 +1,7 @@
 # Release configuration. Build locally with:
 #   goreleaser release --snapshot --clean
-# Releases are published by .github/workflows/release.yml on a v* tag.
+# Releases are cut with scripts/release.sh, which pushes an annotated v* tag;
+# .github/workflows/release.yml then publishes it.
 version: 2
 
 project_name: dropgitbox
@@ -77,6 +78,13 @@ release:
   github:
     owner: dhruvasagar
     name: dropgitbox
+  name_template: "{{ .ProjectName }} {{ .Tag }}"
+  # v1.2.0-rc.1 and the like are marked as prereleases.
+  prerelease: auto
+  # The release notes are the annotated tag's message (minus its subject
+  # line), written with scripts/release.sh.
+  header: |
+    {{ .TagBody }}
   footer: |
     ## Install
 
@@ -88,10 +96,5 @@ release:
     [README](https://github.com/dhruvasagar/dropgitbox#readme) to set up a server and devices.
 
 changelog:
-  use: github
-  sort: asc
-  filters:
-    exclude:
-      - "^docs:"
-      - "^test:"
-      - "^chore:"
+  # The notes come from the tag message instead (see release.header).
+  disable: true
