@@ -170,6 +170,15 @@ func (s *Syncer) Watch(ctx context.Context, opts DaemonOptions) error {
 			return nil
 
 		case err := <-watchErr:
+			// On cancellation the watcher returns nil, possibly before
+			// this select sees ctx.Done(): that's a clean stop.
+			if ctx.Err() != nil {
+				s.log.Info("stopped")
+				return nil
+			}
+			if err == nil {
+				err = errors.New("stopped unexpectedly")
+			}
 			return fmt.Errorf("file watcher: %w", err)
 
 		case <-poll.C:
