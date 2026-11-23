@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -329,5 +330,127 @@ func TestSocketPathFallsBackWhenTooLong(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "/"+strings.Repeat("x", 120))
 	if p := daemon.SocketPath(); len(p) > 103 || !strings.HasPrefix(p, os.TempDir()) {
 		t.Fatalf("long path not replaced: %s", p)
+	}
+}
+
+// Folders added to or removed from the config are picked up live.
+func TestDaemonFollowsConfigChanges(t *testing.T) {
+	_, newDevice := setup(t)
+	a, b := newDevice("a"), newDevice("b")
+
+	var mu sync.Mutex
+	current := []*client.Syncer{a}
+	cfgFile := filepath.Join(t.TempDir(), "config.toml")
+	touch := func(list ...*client.Syncer) {
+		mu.Lock()
+		current = list
+		mu.Unlock()
+		// A different size each time, so the change is seen even within
+		// the filesystem's timestamp resolution.
+		if err := os.WriteFile(cfgFile, []byte(strings.Repeat("#", len(list)+int(time.Now().UnixNano()%7)+1)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	touch(a)
+
+	sock := socketPath(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- daemon.Run(ctx, []*client.Syncer{a}, daemon.Options{
+			Sync:       client.DaemonOptions{Debounce: 100 * time.Millisecond, MaxDelay: time.Second, Poll: time.Hour},
+			SocketPath: sock, Logger: quiet,
+			ConfigPath: cfgFile, ReloadInterval: 50 * time.Millisecond,
+			Reload: func(context.Context) ([]*client.Syncer, error) {
+				mu.Lock()
+				defer mu.Unlock()
+				return slices.Clone(current), nil
+			},
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	folders := func() []string {
+		c, err := daemon.Dial(sock)
+		if err != nil {
+			return nil
+		}
+		st, err := c.Status(context.Background())
+		if err != nil {
+			return nil
+		}
+		var out []string
+		for _, f := range st.Folders {
+			out = append(out, f.Folder+"="+f.State)
+		}
+		return out
+	}
+	waitFor(t, 5*time.Second, func() bool { return slices.Equal(folders(), []string{a.Dir() + "=idle"}) })
+
+	touch(a, b) // `dropgitbox setup` added b
+	waitFor(t, 5*time.Second, func() bool {
+		f := folders()
+		return len(f) == 2 && f[1] == b.Dir()+"=idle"
+	})
+	// b really syncs: a change there reaches a (same repo).
+	write(t, b, "from-b.txt", "hi\n")
+	waitFor(t, 10*time.Second, func() bool {
+		_, err := os.Stat(filepath.Join(a.Dir(), "from-b.txt"))
+		return err == nil
+	})
+
+	touch(b) // a removed from the config
+	waitFor(t, 5*time.Second, func() bool { return slices.Equal(folders(), []string{b.Dir() + "=idle"}) })
+	if _, err := os.Stat(a.Dir()); err != nil {
+		t.Fatalf("removing a folder from the config must not touch its files: %v", err)
+	}
+}
+
+// A folder with a git repository inside it is not synced, and says why.
+func TestDaemonStopsNestedFolder(t *testing.T) {
+	_, newDevice := setup(t)
+	a := newDevice("a")
+	if out, err := exec.Command("git", "init", "-q", filepath.Join(a.Dir(), "cloned")).CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+
+	// Without config reloading (watch -dir), the daemon exits, saying why.
+	err := daemon.Run(context.Background(), []*client.Syncer{a}, daemon.Options{SocketPath: socketPath(t), Logger: quiet})
+	if err == nil || !strings.Contains(err.Error(), "cloned") {
+		t.Fatalf("want an error naming the nested repo, got %v", err)
+	}
+
+	// Following the config (the usual case), it keeps running and reports
+	// the folder as stopped.
+	sock := socketPath(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- daemon.Run(ctx, []*client.Syncer{a}, daemon.Options{
+			SocketPath: sock, Logger: quiet, ConfigPath: filepath.Join(t.TempDir(), "none.toml"),
+			Reload: func(context.Context) ([]*client.Syncer, error) { return []*client.Syncer{a}, nil },
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	r := &running{sock: sock}
+	waitFor(t, 5*time.Second, func() bool {
+		c, err := daemon.Dial(sock)
+		if err != nil {
+			return false
+		}
+		st, err := c.Status(context.Background())
+		return err == nil && len(st.Folders) == 1 && st.Folders[0].State == daemon.StateStopped
+	})
+	if st := r.state(t); !strings.Contains(st.LastError, "cloned") {
+		t.Fatalf("LastError should name the nested repo: %q", st.LastError)
+	}
+	out, err := r.client(t).Sync(context.Background(), "")
+	if err != nil || len(out) != 1 || out[0].Result != "stopped" {
+		t.Fatalf("sync of a stopped folder: %+v %v", out, err)
 	}
 }

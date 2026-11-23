@@ -128,6 +128,11 @@ func Setup(ctx context.Context, opts SetupOptions) (*Syncer, error) {
 	}
 	cfg := Config{Dir: dir, Server: strings.TrimRight(opts.Server, "/"), Repo: opts.Repo, Token: opts.Token, Device: opts.Device}
 
+	// Before creating anything, here or on the server.
+	if err := CheckNesting(ctx, dir); err != nil {
+		return nil, err
+	}
+
 	if err := createRemoteRepo(ctx, cfg); err != nil {
 		return nil, err
 	}

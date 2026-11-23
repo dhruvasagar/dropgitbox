@@ -26,6 +26,7 @@ const (
 	StateError        = "error"        // last attempt failed; retrying
 	StateOffline      = "offline"      // failing for a while
 	StateUnauthorized = "unauthorized" // token rejected
+	StateStopped      = "stopped"      // not syncing until fixed (see LastError)
 )
 
 // FolderStatus is the live state of one folder.
@@ -55,6 +56,17 @@ type Options struct {
 	SocketPath string
 	Version    string
 	Logger     *slog.Logger
+
+	// Reload, if set, returns the folders the daemon should sync now. It
+	// is called whenever ConfigPath changes, so folders added with
+	// `dropgitbox setup` (or removed from the config) start or stop
+	// syncing without a restart. With Reload set, the daemon keeps running
+	// even with no folders; without it, Run returns once every folder has
+	// stopped.
+	Reload     func(context.Context) ([]*client.Syncer, error)
+	ConfigPath string
+	// ReloadInterval is how often ConfigPath is checked. Default 2s.
+	ReloadInterval time.Duration
 }
 
 // Daemon is a running client daemon.
@@ -67,7 +79,24 @@ type Daemon struct {
 	folders map[string]*FolderStatus // by folder path
 	order   []string
 	kicks   map[string]chan struct{}
+	running map[string]*folderRun
 	subs    map[chan client.Event]struct{}
+	wg      sync.WaitGroup // folder goroutines
+}
+
+// folderRun is one folder's sync loop.
+type folderRun struct {
+	cancel context.CancelFunc
+	done   chan struct{} // closed when the loop has exited
+}
+
+func (r *folderRun) exited() bool {
+	select {
+	case <-r.done:
+		return true
+	default:
+		return false
+	}
 }
 
 // ErrAlreadyRunning is returned when another daemon owns the socket.
@@ -81,18 +110,17 @@ func Run(ctx context.Context, folders []*client.Syncer, opts Options) error {
 	if opts.SocketPath == "" {
 		opts.SocketPath = SocketPath()
 	}
+	if opts.ReloadInterval <= 0 {
+		opts.ReloadInterval = 2 * time.Second
+	}
 	d := &Daemon{
 		opts:    opts,
 		log:     opts.Logger,
 		started: time.Now(),
 		folders: map[string]*FolderStatus{},
 		kicks:   map[string]chan struct{}{},
+		running: map[string]*folderRun{},
 		subs:    map[chan client.Event]struct{}{},
-	}
-	for _, s := range folders {
-		d.folders[s.Dir()] = &FolderStatus{Folder: s.Dir(), Repo: s.Config().Repo, State: StateIdle, Since: time.Now()}
-		d.order = append(d.order, s.Dir())
-		d.kicks[s.Dir()] = make(chan struct{}, 1)
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -119,37 +147,180 @@ func Run(ctx context.Context, folders []*client.Syncer, opts Options) error {
 		}()
 	}
 
-	var (
-		wg     sync.WaitGroup
-		failMu sync.Mutex
-		failed int
-	)
 	for _, s := range folders {
-		o := opts.Sync
-		o.OnEvent = d.publish
-		o.Kick = d.kicks[s.Dir()]
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := s.Watch(ctx, o); err != nil {
-				d.log.Error("folder stopped", "folder", s.Dir(), "err", err)
-				d.setError(s.Dir(), err)
-				failMu.Lock()
-				failed++
-				failMu.Unlock()
-			}
-		}()
+		d.startFolder(ctx, s)
 	}
 	d.log.Info("dropgitbox daemon running", "folders", len(folders), "socket", opts.SocketPath, "version", opts.Version)
 
-	wg.Wait()
+	var result error
+	if opts.Reload != nil {
+		d.watchConfig(ctx) // until ctx is cancelled
+	} else {
+		d.wg.Wait()
+		if ctx.Err() == nil && len(folders) > 0 {
+			result = d.stoppedError()
+		}
+	}
+
 	cancel()
+	d.wg.Wait()
 	<-srvDone
 	notifiers.Wait()
-	if failed > 0 && failed == len(folders) {
-		return fmt.Errorf("all %d folder(s) stopped with errors", failed)
+	return result
+}
+
+// stoppedError explains why every folder stopped, once the daemon is
+// about to exit and `status` can no longer be asked.
+func (d *Daemon) stoppedError() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var errs []error
+	for _, p := range d.order {
+		if f := d.folders[p]; f.State == StateStopped {
+			errs = append(errs, fmt.Errorf("%s: %s", p, f.LastError))
+		}
 	}
-	return nil
+	return fmt.Errorf("no folders left to sync:\n%w", errors.Join(errs...))
+}
+
+// startFolder starts syncing s, unless it is already syncing. A folder
+// whose loop has stopped (e.g. with an error) is started again.
+func (d *Daemon) startFolder(ctx context.Context, s *client.Syncer) {
+	dir := s.Dir()
+	d.mu.Lock()
+	if r := d.running[dir]; r != nil && !r.exited() {
+		d.mu.Unlock()
+		return
+	}
+	if d.folders[dir] == nil {
+		d.order = append(d.order, dir)
+	}
+	d.folders[dir] = &FolderStatus{Folder: dir, Repo: s.Config().Repo, State: StateIdle, Since: time.Now()}
+	kick := make(chan struct{}, 1)
+	d.kicks[dir] = kick
+	fctx, cancel := context.WithCancel(ctx)
+	r := &folderRun{cancel: cancel, done: make(chan struct{})}
+	d.running[dir] = r
+	d.wg.Add(1)
+	d.mu.Unlock()
+
+	o := d.opts.Sync
+	o.OnEvent = d.publish
+	o.Kick = kick
+	go func() {
+		defer d.wg.Done()
+		defer close(r.done)
+		defer cancel()
+		// Checked here as well as at setup, for folders set up before the
+		// check existed and for repositories created inside a folder since.
+		if err := client.CheckNesting(fctx, dir); err != nil {
+			if fctx.Err() == nil {
+				d.log.Error("not syncing folder", "folder", dir, "err", err)
+				d.setStopped(dir, err)
+			}
+			return
+		}
+		if err := s.Watch(fctx, o); err != nil {
+			d.log.Error("folder stopped", "folder", dir, "err", err)
+			d.setStopped(dir, err)
+		}
+	}()
+}
+
+// stopFolder stops syncing dir and forgets it. Its files stay as they are.
+func (d *Daemon) stopFolder(dir string) {
+	d.mu.Lock()
+	r := d.running[dir]
+	d.mu.Unlock()
+	if r == nil {
+		return
+	}
+	r.cancel()
+	<-r.done
+	d.mu.Lock()
+	delete(d.running, dir)
+	delete(d.folders, dir)
+	delete(d.kicks, dir)
+	d.order = slices.DeleteFunc(d.order, func(p string) bool { return p == dir })
+	d.mu.Unlock()
+}
+
+// watchConfig applies config changes until ctx is cancelled: new folders
+// start syncing, removed ones stop, and stopped ones get another try.
+func (d *Daemon) watchConfig(ctx context.Context) {
+	last := statFile(d.opts.ConfigPath)
+	t := time.NewTicker(d.opts.ReloadInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		cur := statFile(d.opts.ConfigPath)
+		if sameStat(last, cur) {
+			continue
+		}
+		last = cur
+		d.reload(ctx)
+	}
+}
+
+func (d *Daemon) reload(ctx context.Context) {
+	folders, err := d.opts.Reload(ctx)
+	if err != nil {
+		d.log.Warn("config changed but could not be loaded; keeping the current folders", "err", err)
+		return
+	}
+	want := map[string]bool{}
+	for _, s := range folders {
+		want[s.Dir()] = true
+	}
+	d.mu.Lock()
+	var gone []string
+	for dir := range d.running {
+		if !want[dir] {
+			gone = append(gone, dir)
+		}
+	}
+	d.mu.Unlock()
+	for _, dir := range gone {
+		d.log.Info("folder removed from the config; no longer syncing it", "folder", dir)
+		d.stopFolder(dir)
+	}
+	for _, s := range folders {
+		d.mu.Lock()
+		r := d.running[s.Dir()]
+		d.mu.Unlock()
+		switch {
+		case r == nil:
+			d.log.Info("folder added to the config; syncing it", "folder", s.Dir(), "repo", s.Config().Repo)
+		case r.exited():
+			d.log.Info("config changed; retrying stopped folder", "folder", s.Dir())
+		default:
+			continue
+		}
+		d.startFolder(ctx, s)
+	}
+}
+
+// fileStat is what's compared to notice a config change: config edits are
+// atomic renames, so the inode changes even when size and mtime don't.
+type fileStat struct {
+	info os.FileInfo
+	err  error
+}
+
+func statFile(path string) fileStat {
+	fi, err := os.Stat(path)
+	return fileStat{fi, err}
+}
+
+func sameStat(a, b fileStat) bool {
+	if a.err != nil || b.err != nil {
+		return (a.err != nil) == (b.err != nil)
+	}
+	return os.SameFile(a.info, b.info) && a.info.Size() == b.info.Size() && a.info.ModTime().Equal(b.info.ModTime())
 }
 
 // publish applies an event to the state table and fans it out.
@@ -207,11 +378,11 @@ func apply(f *FolderStatus, ev client.Event) {
 	}
 }
 
-func (d *Daemon) setError(folder string, err error) {
+func (d *Daemon) setStopped(folder string, err error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if f := d.folders[folder]; f != nil {
-		f.State, f.Since, f.LastError = StateError, time.Now(), "stopped: "+err.Error()
+		f.State, f.Since, f.LastError = StateStopped, time.Now(), err.Error()
 	}
 }
 

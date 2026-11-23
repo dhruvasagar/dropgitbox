@@ -139,7 +139,7 @@ func (d *Daemon) serveEvents(w http.ResponseWriter, r *http.Request) {
 // SyncOutcome is the result of a sync requested over the socket.
 type SyncOutcome struct {
 	Folder  string `json:"folder"`
-	Result  string `json:"result"` // synced, conflict, error, timeout
+	Result  string `json:"result"` // synced, conflict, stopped, error, timeout
 	Message string `json:"message,omitempty"`
 }
 
@@ -161,6 +161,10 @@ func (d *Daemon) serveSync(w http.ResponseWriter, r *http.Request) {
 		if f.State == StateConflict {
 			out = append(out, SyncOutcome{Folder: f.Folder, Result: "conflict",
 				Message: "paused on a conflict in: " + strings.Join(f.Conflicts, ", ")})
+			continue
+		}
+		if f.State == StateStopped {
+			out = append(out, SyncOutcome{Folder: f.Folder, Result: "stopped", Message: f.LastError})
 			continue
 		}
 		pending[f.Folder] = true

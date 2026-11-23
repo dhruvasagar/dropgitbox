@@ -212,6 +212,11 @@ func (s *Syncer) Watch(ctx context.Context, opts DaemonOptions) error {
 					emit(Event{Type: EventRemoteChanges, Pulled: len(res.Pulled), Files: res.Pulled})
 				}
 
+			case errors.Is(err, ErrNested):
+				// Retrying can't help until the user moves the repository.
+				emit(Event{Type: EventError, Message: err.Error()})
+				return err
+
 			case errors.Is(err, ErrConflict):
 				paused = true
 				s.reportConflict(ctx, emit)

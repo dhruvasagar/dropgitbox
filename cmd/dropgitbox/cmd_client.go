@@ -74,7 +74,17 @@ func (e *clientEnv) folders(ctx context.Context, fs *flag.FlagSet, dir string, a
 	if len(e.cfg.Folders) == 0 {
 		return nil, fmt.Errorf("%w\n(or pass -dir, or list folders in the config: see `dropgitbox setup`)", err)
 	}
+	out := e.configuredFolders(ctx, autoSetup)
+	if len(out) == 0 {
+		return nil, errors.New("none of the configured folders could be opened")
+	}
+	return out, nil
+}
 
+// configuredFolders opens the folders listed in the config, setting up any
+// that aren't yet (with autoSetup). Folders that can't be opened are
+// logged and skipped.
+func (e *clientEnv) configuredFolders(ctx context.Context, autoSetup bool) []*client.Syncer {
 	var out []*client.Syncer
 	for _, f := range e.cfg.Folders {
 		path := e.cfg.Resolve(f.Path)
@@ -96,10 +106,7 @@ func (e *clientEnv) folders(ctx context.Context, fs *flag.FlagSet, dir string, a
 		}
 		out = append(out, s)
 	}
-	if len(out) == 0 {
-		return nil, errors.New("none of the configured folders could be opened")
-	}
-	return out, nil
+	return out
 }
 
 func (e *clientEnv) setup(ctx context.Context, dir, repo, srvURL, token string, tokenFromConfig bool, device string) (*client.Syncer, error) {
@@ -281,9 +288,25 @@ func cmdSetup(ctx context.Context, args []string) error {
 		printConflictHelp(ctx, s)
 		return client.ErrConflict
 	}
-	fmt.Printf("%s is now synced with %s (repo %q).\nRun `dropgitbox watch` (or enable the dropgitbox service) to keep it in sync.\n",
-		s.Dir(), s.Config().Server, s.Config().Repo)
+	fmt.Printf("%s is now synced with %s (repo %q).\n", s.Dir(), s.Config().Server, s.Config().Repo)
+	switch {
+	case daemonRunning(ctx) && !*noRegister:
+		fmt.Println("The running daemon picks it up within a few seconds (`dropgitbox status` shows it).")
+	case daemonRunning(ctx):
+		fmt.Println("It isn't in the config (-no-register), so the running daemon won't sync it; use `dropgitbox sync -dir` to sync it.")
+	default:
+		fmt.Println("Run `dropgitbox watch` (or enable the dropgitbox service) to keep it in sync.")
+	}
 	return nil
+}
+
+func daemonRunning(ctx context.Context) bool {
+	c, err := daemon.Dial("")
+	if err != nil {
+		return false
+	}
+	_, err = c.Status(ctx)
+	return err == nil
 }
 
 func cmdWatch(ctx context.Context, args []string) error {
@@ -331,7 +354,31 @@ func cmdWatch(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return daemon.Run(ctx, folders, daemon.Options{Sync: syncOpts, Notify: notify, Version: version, Logger: e.log})
+	opts := daemon.Options{Sync: syncOpts, Notify: notify, Version: version, Logger: e.log}
+
+	// Syncing the folders listed in the config (rather than one given with
+	// -dir or the current directory): follow changes to that list, so
+	// `dropgitbox setup` takes effect without a restart.
+	if fromConfig := !isSet(fs, "dir") && !isSyncedDir("."); fromConfig {
+		if path, err := e.cfg.WritePath(); err == nil {
+			opts.ConfigPath = path
+			opts.Reload = func(ctx context.Context) ([]*client.Syncer, error) {
+				fresh, err := loadClient(*cfgPath, *verbose)
+				if err != nil {
+					return nil, err
+				}
+				fresh.log = e.log
+				return fresh.configuredFolders(ctx, true), nil
+			}
+		}
+	}
+	return daemon.Run(ctx, folders, opts)
+}
+
+// isSyncedDir reports whether dir is (inside) a set-up dropgitbox folder.
+func isSyncedDir(dir string) bool {
+	_, err := client.Load(dir, client.LoadOptions{Logger: slog.New(slog.DiscardHandler)})
+	return err == nil
 }
 
 func notifyOptions(cfg *config.Config) (daemon.NotifyOptions, error) {
@@ -521,6 +568,8 @@ func describeState(f daemon.FolderStatus) string {
 		return "OFFLINE since " + f.Since.Local().Format(time.DateTime) + ": " + f.LastError
 	case daemon.StateUnauthorized:
 		return "ACCESS DENIED: " + f.LastError
+	case daemon.StateStopped:
+		return "STOPPED, not syncing: " + f.LastError
 	}
 	return f.State
 }
@@ -530,7 +579,7 @@ func shortStatus(st *daemon.Status) string {
 	if st == nil {
 		return "dropgitbox: not running"
 	}
-	rank := map[string]int{daemon.StateUnauthorized: 6, daemon.StateConflict: 5, daemon.StateOffline: 4,
+	rank := map[string]int{daemon.StateUnauthorized: 7, daemon.StateStopped: 6, daemon.StateConflict: 5, daemon.StateOffline: 4,
 		daemon.StateError: 3, daemon.StateSyncing: 2, daemon.StatePending: 1, daemon.StateIdle: 0}
 	worst, names := daemon.StateIdle, []string{}
 	for _, f := range st.Folders {
@@ -545,6 +594,8 @@ func shortStatus(st *daemon.Status) string {
 	switch worst {
 	case daemon.StateUnauthorized:
 		return "dropgitbox: access denied" + in
+	case daemon.StateStopped:
+		return "dropgitbox: STOPPED" + in
 	case daemon.StateConflict:
 		return "dropgitbox: CONFLICT" + in
 	case daemon.StateOffline:

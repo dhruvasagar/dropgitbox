@@ -236,6 +236,9 @@ func (s *Syncer) commitLocal(ctx context.Context) (string, []string, error) {
 	if _, err := s.git.Run(ctx, "add", "--all"); err != nil {
 		return "", nil, err
 	}
+	if err := s.refuseEmbeddedRepos(ctx); err != nil {
+		return "", nil, err
+	}
 	out, err := s.git.Run(ctx, "diff", "--cached", "--name-status", "--no-renames")
 	if err != nil {
 		return "", nil, err
@@ -259,6 +262,38 @@ func (s *Syncer) commitLocal(ctx context.Context) (string, []string, error) {
 		_, paths[i], _ = strings.Cut(c, "\t")
 	}
 	return head, paths, nil
+}
+
+// refuseEmbeddedRepos stops a commit that would record a git repository
+// created inside the folder (e.g. by `git clone`) as a gitlink, which syncs
+// a commit pointer instead of the files. The staged entry is undone and an
+// ErrNested error returned, so the folder stops until the repository is
+// moved out.
+func (s *Syncer) refuseEmbeddedRepos(ctx context.Context) error {
+	out, err := s.git.Run(ctx, "diff", "--cached", "--raw", "--no-renames", "--diff-filter=AM")
+	if err != nil {
+		return err
+	}
+	var nested []string
+	for _, l := range gitx.Lines(out) {
+		// ":000000 160000 0000000 1234567 A\tpath": the new mode is 160000.
+		meta, path, ok := strings.Cut(l, "\t")
+		if f := strings.Fields(meta); ok && len(f) >= 2 && f[1] == "160000" {
+			nested = append(nested, path)
+		}
+	}
+	if len(nested) == 0 {
+		return nil
+	}
+	// --cached touches only the index, never the files on disk.
+	args := append([]string{"rm", "--cached", "--force", "--quiet", "-r", "--"}, nested...)
+	if _, err := s.git.Run(ctx, args...); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: %s contains git repositories (%s).\n"+
+		"Their files would not be synced, so this folder has stopped syncing. Move them out of the folder "+
+		"(or delete their .git), then restart the daemon (e.g. systemctl --user restart dropgitbox)",
+		ErrNested, s.cfg.Dir, strings.Join(nested, ", "))
 }
 
 func (s *Syncer) merge(ctx context.Context) error {

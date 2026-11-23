@@ -128,6 +128,27 @@ Repeat for every device. `dropgitbox repos` shows the folders already on
 the server, so a new device can pick which ones to sync. The invite
 contains the token, so **send it privately**.
 
+**Several folders.** Run `setup` once per folder, each with its own repo:
+
+```sh
+dropgitbox setup -repo Notes  -dir ~/Notes
+dropgitbox setup -repo Photos -dir ~/Pictures/Synced
+```
+
+One daemon syncs them all, each with its own history and its own line in
+`status`. A conflict in one folder doesn't stop the others. Each device
+chooses its own set, and a repo can live at a different path on each
+device. The daemon follows its config file, so a folder added with
+`setup`, or removed from `[[folders]]`, starts or stops syncing within a
+couple of seconds, with no restart. Removing a folder never touches its
+files.
+
+Synced folders can't be nested. `setup` refuses a folder that is inside
+another synced folder, or that contains any git repository. Git can only
+record a repository inside another one as a pointer to a commit, not as
+files, so those files would silently not sync. A git repository *around*
+the folder is fine, e.g. a dotfiles repo at `~/.git`.
+
 **Faster for more devices:** copy the `[[folders]]` list from an existing
 device's `~/.config/dropgitbox/config.toml` to the new one. The file holds
 no secrets and uses `~` paths, so it suits a dotfiles repo. Then run
@@ -244,7 +265,8 @@ $ dropgitbox events
 ```
 
 `status -short` prints one line, the most urgent state across folders:
-`synced`, `pending`, `syncing`, `retrying`, `offline`, `CONFLICT` or
+`synced`, `pending`, `syncing`, `retrying`, `offline`, `CONFLICT`,
+`STOPPED` (the folder needs fixing, see `dropgitbox status`) or
 `access denied`. Use it in status bars and prompts:
 
 ```sh
@@ -523,8 +545,10 @@ The output goes to `dist/`.
   in full, on every device. That is the point, but it makes dropgitbox a
   poor fit for large media. Git LFS support would be the natural next step.
 - **Empty directories** are not synced, because git does not track them.
-- **Nested git repositories** inside a synced folder are recorded as
-  gitlinks, not their contents. Don't put other repos inside a synced folder.
+- **No git repositories inside a synced folder.** `setup` refuses them. If
+  one appears later (say you `git clone` into the folder), the next sync
+  refuses to commit it and the folder shows as `STOPPED`, naming the
+  repository. Move it out, then restart the daemon.
 - **Single user.** Every device can access every folder on the server.
   There are no per-folder permissions.
 - Binary-file conflicts produce no markers, and this device's version is

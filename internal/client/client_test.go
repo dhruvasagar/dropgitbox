@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -567,5 +568,94 @@ func TestHistoryProtectionIgnoresRepoConfig(t *testing.T) {
 	}
 	if _, err := g.Run(ctx, "push", "origin", ":refs/heads/main"); err == nil {
 		t.Fatal("branch deletion accepted after weakening repo config")
+	}
+}
+
+func setupErr(ts *httptest.Server, dir, repo string) error {
+	_, err := client.Setup(context.Background(), client.SetupOptions{
+		Dir: dir, Server: ts.URL, Repo: repo, Token: token, Device: "d", Logger: quiet,
+	})
+	return err
+}
+
+func TestSetupRefusesNestedFolders(t *testing.T) {
+	ts := startServer(t)
+	outer := setup(t, ts, "a")
+
+	// Inside a synced folder, including through a symlink.
+	inner := filepath.Join(outer.Dir(), "Work")
+	if err := setupErr(ts, inner, "work"); !errors.Is(err, client.ErrNested) {
+		t.Fatalf("inside a synced folder: want ErrNested, got %v", err)
+	}
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(outer.Dir(), link); err != nil {
+		t.Fatal(err)
+	}
+	if err := setupErr(ts, filepath.Join(link, "Work"), "work"); !errors.Is(err, client.ErrNested) {
+		t.Fatalf("inside a synced folder via a symlink: want ErrNested, got %v", err)
+	}
+
+	// Containing a git repository, synced or not.
+	plain := t.TempDir()
+	if out, err := exec.Command("git", "init", "-q", filepath.Join(plain, "deep", "repo")).CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	err := setupErr(ts, plain, "plain")
+	if !errors.Is(err, client.ErrNested) || !strings.Contains(err.Error(), filepath.Join("deep", "repo")) {
+		t.Fatalf("containing a repo: want ErrNested naming deep/repo, got %v", err)
+	}
+	if err := setupErr(ts, filepath.Dir(outer.Dir()), "parent"); !errors.Is(err, client.ErrNested) {
+		t.Fatalf("containing a synced folder: want ErrNested, got %v", err)
+	}
+
+	// Refused before anything was created on the server.
+	repos, err := client.ListRepos(context.Background(), ts.URL, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range repos {
+		if r.Name != "docs" {
+			t.Errorf("refused setup still created repo %q on the server", r.Name)
+		}
+	}
+
+	// An ordinary git repository around the folder (e.g. dotfiles in ~) is fine.
+	home := t.TempDir()
+	if out, err := exec.Command("git", "init", "-q", home).CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if err := setupErr(ts, filepath.Join(home, "Box"), "box"); err != nil {
+		t.Fatalf("inside a plain git repo should be allowed: %v", err)
+	}
+}
+
+// A repository cloned into a synced folder later is never committed as a
+// gitlink: the sync refuses, and nothing about it reaches the server.
+func TestSyncRefusesEmbeddedRepo(t *testing.T) {
+	ts := startServer(t)
+	a := setup(t, ts, "a")
+	write(t, a, "keep.txt", "fine\n")
+	mustSync(t, a)
+	if out, err := exec.Command("git", "init", "-q", filepath.Join(a.Dir(), "cloned")).CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	sub := &gitx.Repo{Dir: filepath.Join(a.Dir(), "cloned")}
+	if err := os.WriteFile(filepath.Join(sub.Dir, "f"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sub.Run(context.Background(), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x", "--allow-empty"); err != nil {
+		t.Fatal(err)
+	}
+	write(t, a, "other.txt", "also changed\n")
+
+	err := a.Sync(context.Background())
+	if !errors.Is(err, client.ErrNested) || !strings.Contains(err.Error(), "cloned") {
+		t.Fatalf("want ErrNested naming cloned, got %v", err)
+	}
+	if out, _ := a.Git().Run(context.Background(), "ls-files", "--stage", "cloned"); strings.TrimSpace(out) != "" {
+		t.Fatalf("nested repo left in the index: %q", out)
+	}
+	if out, _ := a.Git().Run(context.Background(), "log", "--format=%s", "-1"); strings.Contains(out, "cloned") {
+		t.Fatalf("nested repo was committed: %q", out)
 	}
 }
