@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -41,9 +42,11 @@ func ValidRepoName(name string) bool {
 type Options struct {
 	// DataDir holds the bare repositories (<name>.git).
 	DataDir string
-	// Token is the shared secret clients must present. An empty token
-	// disables authentication entirely.
+	// Token is an optional shared secret accepted in addition to the
+	// per-device tokens in DevicesFile.
 	Token string
+	// NoAuth disables authentication entirely (trusted networks only).
+	NoAuth bool
 	// Logger receives request and push logs. Defaults to slog.Default().
 	Logger *slog.Logger
 	// Heartbeat is the interval between keep-alive comments on event
@@ -55,6 +58,8 @@ type Options struct {
 type Server struct {
 	dataDir   string
 	token     string
+	noAuth    bool
+	devices   *registry
 	log       *slog.Logger
 	heartbeat time.Duration
 	hub       *hub
@@ -94,6 +99,8 @@ func New(opts Options) (*Server, error) {
 	return &Server{
 		dataDir:   dataDir,
 		token:     opts.Token,
+		noAuth:    opts.NoAuth,
+		devices:   newRegistry(dataDir),
 		log:       opts.Logger,
 		heartbeat: opts.Heartbeat,
 		hub:       newHub(),
@@ -103,9 +110,6 @@ func New(opts Options) (*Server, error) {
 			Env: []string{
 				"GIT_PROJECT_ROOT=" + dataDir,
 				"GIT_HTTP_EXPORT_ALL=1",
-				// Requests reaching the backend are already authenticated;
-				// git-http-backend only allows pushes when REMOTE_USER is set.
-				"REMOTE_USER=dropgitbox",
 				"GIT_CONFIG_NOSYSTEM=1",
 			},
 			InheritEnv: []string{"PATH", "HOME"},
@@ -119,6 +123,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "ok")
 	})
+	mux.Handle("GET /api/v1/whoami", s.auth(http.HandlerFunc(s.whoami)))
 	mux.Handle("GET /api/v1/repos", s.auth(http.HandlerFunc(s.listRepos)))
 	mux.Handle("GET /api/v1/repos/{name}", s.auth(http.HandlerFunc(s.getRepo)))
 	mux.Handle("POST /api/v1/repos/{name}", s.auth(http.HandlerFunc(s.createRepo)))
@@ -141,28 +146,66 @@ func (s *Server) head(ctx context.Context, name string) (string, error) {
 	return bare.RevParse(ctx, "refs/heads/"+Branch)
 }
 
-// auth enforces the shared token. It accepts "Authorization: Bearer <token>"
-// (used by dropgitbox clients) and HTTP Basic auth with the token as the
-// password (so the repository can also be cloned with plain git).
+type ctxKey struct{}
+
+// DeviceFrom returns the authenticated device name for a request.
+func DeviceFrom(r *http.Request) string {
+	name, _ := r.Context().Value(ctxKey{}).(string)
+	return name
+}
+
+// NumDevices returns how many devices are registered.
+func (s *Server) NumDevices() (int, error) { return s.devices.count() }
+
+// AuthEnabled reports whether requests must be authenticated.
+func (s *Server) AuthEnabled() bool { return !s.noAuth }
+
+// auth authenticates a request by device token (or the optional shared
+// token). It accepts "Authorization: Bearer <token>" (used by dropgitbox
+// clients) and HTTP Basic auth with the token as the password (so plain git
+// can clone too).
 func (s *Server) auth(next http.Handler) http.Handler {
-	if s.token == "" {
-		return next
-	}
-	want := []byte(s.token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var got string
-		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-			got = strings.TrimPrefix(h, "Bearer ")
-		} else if _, pw, ok := r.BasicAuth(); ok {
-			got = pw
+		device, err := s.authenticate(r)
+		if err != nil {
+			s.log.Error("authentication failed", "err", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
 		}
-		if subtle.ConstantTimeCompare([]byte(got), want) != 1 {
+		if device == "" {
 			w.Header().Set("WWW-Authenticate", `Basic realm="dropgitbox"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, device)))
 	})
+}
+
+func (s *Server) authenticate(r *http.Request) (string, error) {
+	if s.noAuth {
+		return "anonymous", nil
+	}
+	var got string
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+		got = strings.TrimPrefix(h, "Bearer ")
+	} else if _, pw, ok := r.BasicAuth(); ok {
+		got = pw
+	}
+	if got == "" {
+		return "", nil
+	}
+	if s.token != "" && subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1 {
+		return "shared", nil
+	}
+	name, ok, err := s.devices.lookup(got)
+	if err != nil || !ok {
+		return "", err
+	}
+	return name, nil
+}
+
+func (s *Server) whoami(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"device": DeviceFrom(r)})
 }
 
 type repoInfo struct {
@@ -230,7 +273,7 @@ func (s *Server) createRepo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.log.Info("created repo", "repo", name)
+	s.log.Info("created repo", "repo", name, "device", DeviceFrom(r))
 	writeJSON(w, http.StatusCreated, repoInfo{Name: name})
 }
 
@@ -267,8 +310,14 @@ func (s *Server) git(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	device := DeviceFrom(r)
+	// git-http-backend only accepts pushes when REMOTE_USER is set; the
+	// request is already authenticated, so pass the device name along.
+	backend := *s.backend
+	backend.Env = append(slices.Clone(s.backend.Env), "REMOTE_USER="+device)
+
 	before, _ := s.head(r.Context(), name)
-	s.backend.ServeHTTP(w, r)
+	backend.ServeHTTP(w, r)
 
 	if r.Method == http.MethodPost && strings.HasSuffix(rest, "/git-receive-pack") {
 		after, err := s.head(r.Context(), name)
@@ -277,7 +326,7 @@ func (s *Server) git(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if after != "" && after != before {
-			s.log.Info("push", "repo", name, "head", after)
+			s.log.Info("push", "repo", name, "device", device, "head", after)
 			s.hub.publish(Event{Repo: name, Head: after})
 		}
 	}
@@ -326,6 +375,10 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case <-tick.C:
+			// Drop streams of devices revoked since they connected.
+			if dev, err := s.authenticate(r); err != nil || dev == "" {
+				return
+			}
 			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
 				return
 			}

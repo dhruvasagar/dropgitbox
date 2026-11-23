@@ -5,36 +5,50 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
-	"net"
-	"net/http"
 	"os"
 	"os/signal"
-	"strings"
+	"runtime/debug"
 	"syscall"
-	"time"
 
-	"github.com/dhruvasagar/dropgitbox/internal/client"
-	"github.com/dhruvasagar/dropgitbox/internal/server"
+	"github.com/dhruvasagar/dropgitbox/internal/config"
+)
+
+// Set by the release build (-ldflags "-X main.version=...").
+var (
+	version = "dev"
+	commit  = ""
+	date    = ""
 )
 
 const usage = `dropgitbox - git-backed folder sync
 
-Usage:
-  dropgitbox server  [-addr :8080] [-data ./data] [-token T | -no-auth]
-  dropgitbox setup   -server URL -repo NAME [-token T] [-device NAME] [-dir DIR]
-  dropgitbox watch   [-dir DIR]            run the sync daemon
-  dropgitbox sync    [-dir DIR]            commit and sync once
-  dropgitbox status  [-dir DIR]
-  dropgitbox resolve [-dir DIR] [-ours | -theirs] [-force] [PATH...]
-  dropgitbox log     [-dir DIR] [-n N] [PATH...]
-  dropgitbox restore [-dir DIR] -rev REV PATH...
+Server node:
+  dropgitbox server                      run the server
+  dropgitbox device add NAME             register a device and print its invite
+  dropgitbox device list | revoke NAME   manage devices
 
-The token may also be given in the DROPGITBOX_TOKEN environment variable.
-Run "dropgitbox <command> -h" for the flags of a command.
+Client device:
+  dropgitbox join INVITE                 connect this device to a server
+  dropgitbox repos                       list folders available on the server
+  dropgitbox setup -repo NAME -dir DIR   sync a folder (and register it in the config)
+  dropgitbox watch                       run the sync daemon for all configured folders
+  dropgitbox sync                        commit and sync once
+  dropgitbox status
+  dropgitbox resolve [-ours | -theirs] [-force] [PATH...]
+  dropgitbox log [-n N] [PATH...]
+  dropgitbox restore -rev REV PATH...
+
+Other:
+  dropgitbox config                      show which config file is used
+  dropgitbox version
+
+Every command accepts -config FILE (default: $XDG_CONFIG_HOME/dropgitbox/config.toml).
+Folder commands accept -dir DIR; without it they act on the folder containing
+the current directory, or on every configured folder.
+Run "dropgitbox <command> -h" for details.
 `
 
 func main() {
@@ -47,36 +61,97 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	var err error
+	commands := map[string]func(context.Context, []string) error{
+		"server":  cmdServer,
+		"device":  cmdDevice,
+		"join":    cmdJoin,
+		"repos":   cmdRepos,
+		"setup":   cmdSetup,
+		"watch":   cmdWatch,
+		"sync":    cmdSync,
+		"status":  cmdStatus,
+		"resolve": cmdResolve,
+		"log":     cmdLog,
+		"restore": cmdRestore,
+		"config":  cmdConfig,
+		"version": cmdVersion,
+	}
 	switch cmd {
-	case "server":
-		err = cmdServer(ctx, args)
-	case "setup":
-		err = cmdSetup(ctx, args)
-	case "watch":
-		err = cmdWatch(ctx, args)
-	case "sync":
-		err = cmdSync(ctx, args)
-	case "status":
-		err = cmdStatus(ctx, args)
-	case "resolve":
-		err = cmdResolve(ctx, args)
-	case "log":
-		err = cmdLog(ctx, args)
-	case "restore":
-		err = cmdRestore(ctx, args)
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 		return
-	default:
+	case "-v", "--version":
+		cmd = "version"
+	}
+	run, ok := commands[cmd]
+	if !ok {
 		fmt.Fprintf(os.Stderr, "dropgitbox: unknown command %q\n\n%s", cmd, usage)
 		os.Exit(2)
 	}
-	if err != nil {
+	if err := run(ctx, args); err != nil {
 		fmt.Fprintln(os.Stderr, "dropgitbox:", err)
 		os.Exit(1)
 	}
 }
+
+func cmdVersion(_ context.Context, _ []string) error {
+	v, c, d := version, commit, date
+	if bi, ok := debug.ReadBuildInfo(); ok && v == "dev" {
+		if bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+			v = bi.Main.Version
+		}
+		for _, s := range bi.Settings {
+			switch s.Key {
+			case "vcs.revision":
+				if c == "" {
+					c = s.Value
+				}
+			case "vcs.time":
+				if d == "" {
+					d = s.Value
+				}
+			}
+		}
+	}
+	fmt.Printf("dropgitbox %s", v)
+	if c != "" {
+		if len(c) > 12 {
+			c = c[:12]
+		}
+		fmt.Printf(" (commit %s", c)
+		if d != "" {
+			fmt.Printf(", built %s", d)
+		}
+		fmt.Print(")")
+	}
+	fmt.Println()
+	return nil
+}
+
+func cmdConfig(_ context.Context, args []string) error {
+	fs, cfgPath := newFlags("config")
+	parse(fs, args)
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		return err
+	}
+	if cfg.Path() == "" {
+		fmt.Println("No config file found. Searched:")
+	} else {
+		fmt.Println("Using:", cfg.Path())
+		fmt.Println("Search order:")
+	}
+	fmt.Println("  -config flag, $" + config.EnvConfig)
+	for _, p := range config.SearchPaths() {
+		fmt.Println("  " + p)
+	}
+	if w, err := cfg.WritePath(); err == nil {
+		fmt.Println("Settings are saved to:", w)
+	}
+	return nil
+}
+
+// ---- helpers ----------------------------------------------------------
 
 func newLogger(verbose bool) *slog.Logger {
 	level := slog.LevelInfo
@@ -86,239 +161,49 @@ func newLogger(verbose bool) *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 }
 
-func flagSet(name string) *flag.FlagSet {
-	return flag.NewFlagSet("dropgitbox "+name, flag.ExitOnError)
+// newFlags returns a flag set with the common -config flag.
+func newFlags(name string) (*flag.FlagSet, *string) {
+	fs := flag.NewFlagSet("dropgitbox "+name, flag.ExitOnError)
+	cfgPath := fs.String("config", "", "config file (default: search $XDG_CONFIG_HOME, $XDG_CONFIG_DIRS, /etc)")
+	return fs, cfgPath
 }
 
-func cmdServer(ctx context.Context, args []string) error {
-	fs := flagSet("server")
-	addr := fs.String("addr", ":8080", "listen address")
-	data := fs.String("data", "./data", "directory holding the repositories")
-	token := fs.String("token", os.Getenv("DROPGITBOX_TOKEN"), "shared access token")
-	noAuth := fs.Bool("no-auth", false, "disable authentication (trusted networks only)")
-	verbose := fs.Bool("v", false, "verbose logging")
-	_ = fs.Parse(args)
-
-	if *token == "" && !*noAuth {
-		return errors.New("server: set -token (or DROPGITBOX_TOKEN), or pass -no-auth explicitly")
+// parse parses args allowing flags and positional arguments to be mixed
+// ("device add laptop -url X" as well as "device add -url X laptop").
+func parse(fs *flag.FlagSet, args []string) []string {
+	var positional []string
+	for {
+		_ = fs.Parse(args)
+		rest := fs.Args()
+		if len(rest) == 0 {
+			return positional
+		}
+		if rest[0] == "--" {
+			return append(positional, rest[1:]...)
+		}
+		positional = append(positional, rest[0])
+		args = rest[1:]
 	}
-	if *noAuth {
-		*token = ""
-	}
-	log := newLogger(*verbose)
-	srv, err := server.New(server.Options{DataDir: *data, Token: *token, Logger: log})
-	if err != nil {
-		return err
-	}
-
-	hs := &http.Server{
-		Addr:              *addr,
-		Handler:           srv.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-		// Long-lived event streams end when the server shuts down.
-		BaseContext: func(net.Listener) context.Context { return ctx },
-	}
-
-	errc := make(chan error, 1)
-	go func() { errc <- hs.ListenAndServe() }()
-	log.Info("dropgitbox server listening", "addr", *addr, "data", *data, "auth", *token != "")
-
-	select {
-	case err := <-errc:
-		return err
-	case <-ctx.Done():
-	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	return hs.Shutdown(shutdownCtx)
 }
 
-func cmdSetup(ctx context.Context, args []string) error {
-	fs := flagSet("setup")
-	srvURL := fs.String("server", "", "server base URL, e.g. https://box.example.com")
-	repo := fs.String("repo", "", "repository name on the server (created if missing)")
-	token := fs.String("token", os.Getenv("DROPGITBOX_TOKEN"), "shared access token")
-	device := fs.String("device", "", "device name used in commit messages (default: hostname)")
-	dir := fs.String("dir", ".", "folder to sync")
-	_ = fs.Parse(args)
-
-	s, err := client.Setup(ctx, client.SetupOptions{
-		Dir: *dir, Server: *srvURL, Repo: *repo, Token: *token, Device: *device, Logger: newLogger(false),
+// isSet reports whether a flag was given explicitly.
+func isSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
 	})
-	if err != nil {
-		if errors.Is(err, client.ErrConflict) {
-			fmt.Fprintln(os.Stderr, "Setup finished, but local files conflict with the server's. Run `dropgitbox status` and `dropgitbox resolve`.")
-		}
-		return err
-	}
-	fmt.Printf("%s is now synced with %s (repo %q).\nRun `dropgitbox watch -dir %s` to keep it in sync.\n",
-		s.Dir(), s.Config().Server, s.Config().Repo, s.Dir())
-	return nil
+	return set
 }
 
-func cmdWatch(ctx context.Context, args []string) error {
-	fs := flagSet("watch")
-	dir := fs.String("dir", ".", "synced folder")
-	debounce := fs.Duration("debounce", 2*time.Second, "quiet period before committing a change")
-	maxDelay := fs.Duration("max-delay", 30*time.Second, "longest a burst of changes may postpone a commit")
-	poll := fs.Duration("poll", 5*time.Minute, "safety-net sync interval")
-	verbose := fs.Bool("v", false, "verbose logging")
-	_ = fs.Parse(args)
-
-	s, err := client.Load(*dir, newLogger(*verbose))
+func loadConfig(path string) (*config.Config, error) {
+	cfg, err := config.Load(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return s.Watch(ctx, client.DaemonOptions{Debounce: *debounce, MaxDelay: *maxDelay, Poll: *poll})
-}
-
-func cmdSync(ctx context.Context, args []string) error {
-	fs := flagSet("sync")
-	dir := fs.String("dir", ".", "synced folder")
-	_ = fs.Parse(args)
-
-	s, err := client.Load(*dir, newLogger(false))
-	if err != nil {
-		return err
+	for _, w := range cfg.Warnings() {
+		fmt.Fprintln(os.Stderr, "dropgitbox: warning:", w)
 	}
-	if err := s.Sync(ctx); err != nil {
-		if errors.Is(err, client.ErrConflict) {
-			printConflictHelp(ctx, s)
-		}
-		return err
-	}
-	fmt.Println("Up to date.")
-	return nil
-}
-
-func cmdStatus(ctx context.Context, args []string) error {
-	fs := flagSet("status")
-	dir := fs.String("dir", ".", "synced folder")
-	_ = fs.Parse(args)
-
-	s, err := client.Load(*dir, newLogger(false))
-	if err != nil {
-		return err
-	}
-	st, err := s.Status(ctx)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("Folder:  %s\nServer:  %s\nRepo:    %s\nDevice:  %s\n", st.Config.Dir, st.Config.Server, st.Config.Repo, st.Config.Device)
-	fmt.Printf("Head:    %s\n", orNone(st.Head))
-	fmt.Printf("Server head (last fetched): %s\n", orNone(st.Remote))
-	fmt.Printf("Ahead %d / behind %d, %d uncommitted change(s)\n", st.Ahead, st.Behind, len(st.Uncommitted))
-	if st.Conflicted {
-		fmt.Println()
-		printConflictHelp(ctx, s)
-	}
-	return nil
-}
-
-func cmdResolve(ctx context.Context, args []string) error {
-	fs := flagSet("resolve")
-	dir := fs.String("dir", ".", "synced folder")
-	ours := fs.Bool("ours", false, "keep this device's version of the conflicted files")
-	theirs := fs.Bool("theirs", false, "keep the server's version of the conflicted files")
-	force := fs.Bool("force", false, "conclude even if conflict markers remain")
-	noSync := fs.Bool("no-sync", false, "only commit the resolution, don't sync")
-	_ = fs.Parse(args)
-
-	if *ours && *theirs {
-		return errors.New("resolve: -ours and -theirs are mutually exclusive")
-	}
-	opts := client.ResolveOptions{Paths: fs.Args(), Force: *force}
-	switch {
-	case *ours:
-		opts.Side = client.SideOurs
-	case *theirs:
-		opts.Side = client.SideTheirs
-	}
-
-	s, err := client.Load(*dir, newLogger(false))
-	if err != nil {
-		return err
-	}
-	head, err := s.Resolve(ctx, opts)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("Conflict resolved in commit %s.\n", head[:10])
-	if *noSync {
-		return nil
-	}
-	if err := s.Sync(ctx); err != nil {
-		if errors.Is(err, client.ErrConflict) {
-			printConflictHelp(ctx, s)
-		}
-		return err
-	}
-	fmt.Println("Synced.")
-	return nil
-}
-
-func cmdLog(ctx context.Context, args []string) error {
-	fs := flagSet("log")
-	dir := fs.String("dir", ".", "synced folder")
-	n := fs.Int("n", 20, "number of commits to show")
-	_ = fs.Parse(args)
-
-	s, err := client.Load(*dir, newLogger(false))
-	if err != nil {
-		return err
-	}
-	gitArgs := []string{"log", fmt.Sprintf("-n%d", *n), "--date=format:%Y-%m-%d %H:%M:%S",
-		"--format=%h  %ad  %s", "--stat=100", "--stat-graph-width=20"}
-	if paths := fs.Args(); len(paths) > 0 {
-		gitArgs = append(gitArgs, "--")
-		gitArgs = append(gitArgs, paths...)
-	}
-	out, err := s.Git().RunRaw(ctx, gitArgs...)
-	if err != nil {
-		return err
-	}
-	fmt.Print(out)
-	return nil
-}
-
-func cmdRestore(ctx context.Context, args []string) error {
-	fs := flagSet("restore")
-	dir := fs.String("dir", ".", "synced folder")
-	rev := fs.String("rev", "", "commit to restore from (see `dropgitbox log`)")
-	_ = fs.Parse(args)
-
-	if *rev == "" || fs.NArg() == 0 {
-		return errors.New("restore: -rev and at least one path are required")
-	}
-	s, err := client.Load(*dir, newLogger(false))
-	if err != nil {
-		return err
-	}
-	if err := s.Restore(ctx, *rev, fs.Args()); err != nil {
-		return err
-	}
-	fmt.Printf("Restored %s from %s. The change will be committed and synced like any other edit.\n",
-		strings.Join(fs.Args(), ", "), *rev)
-	return nil
-}
-
-func printConflictHelp(ctx context.Context, s *client.Syncer) {
-	files, _ := s.ConflictedFiles(ctx)
-	fmt.Println("SYNC PAUSED: changes on this device conflict with changes from the server.")
-	fmt.Println("Conflicted files:")
-	for _, f := range files {
-		fmt.Println("  " + f)
-	}
-	fmt.Println(`
-To resolve, either:
-  - edit each file to remove the <<<<<<< ======= >>>>>>> markers, then run: dropgitbox resolve
-  - keep this device's version:   dropgitbox resolve -ours [PATH...]
-  - keep the server's version:    dropgitbox resolve -theirs [PATH...]`)
-}
-
-func orNone(s string) string {
-	if s == "" {
-		return "(none)"
-	}
-	return s
+	return cfg, nil
 }

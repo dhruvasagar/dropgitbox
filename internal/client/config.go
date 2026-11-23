@@ -6,6 +6,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -86,8 +87,12 @@ type SetupOptions struct {
 	Server string
 	Repo   string
 	Token  string
-	Device string // defaults to the hostname
-	Logger *slog.Logger
+	// TokenFromConfig means Token came from the user's config file: it is
+	// then not copied into the folder, so rotating the token in the config
+	// (e.g. by re-joining) applies to every folder at once.
+	TokenFromConfig bool
+	Device          string // defaults to the hostname
+	Logger          *slog.Logger
 }
 
 // Setup turns Dir into a synced folder: it creates the repository on the
@@ -131,11 +136,11 @@ func Setup(ctx context.Context, opts SetupOptions) (*Syncer, error) {
 		return nil, fmt.Errorf("setup: %s must be the root of its git repository", dir)
 	}
 
-	if err := configureLocal(ctx, g, cfg); err != nil {
+	if err := configureLocal(ctx, g, cfg, !opts.TokenFromConfig); err != nil {
 		return nil, err
 	}
 
-	s, err := Load(dir, opts.Logger)
+	s, err := Load(dir, LoadOptions{Logger: opts.Logger, Token: opts.Token})
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +150,7 @@ func Setup(ctx context.Context, opts SetupOptions) (*Syncer, error) {
 	return s, nil
 }
 
-func configureLocal(ctx context.Context, g *gitx.Repo, cfg Config) error {
+func configureLocal(ctx context.Context, g *gitx.Repo, cfg Config, storeToken bool) error {
 	// Make sure we are on the synced branch (adopted repos may not be).
 	if cur, _ := g.Run(ctx, "symbolic-ref", "--short", "HEAD"); cur != Branch {
 		if head, _ := g.RevParse(ctx, "HEAD"); head == "" {
@@ -198,15 +203,31 @@ func configureLocal(ctx context.Context, g *gitx.Repo, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	if err := writeToken(gitDir, cfg.Token); err != nil {
+	token := cfg.Token
+	if !storeToken {
+		token = "" // removes any stale per-folder token
+	}
+	if err := writeToken(gitDir, token); err != nil {
 		return err
 	}
 	return addExcludes(gitDir)
 }
 
+// ErrNotSetUp is returned by Load for a folder that has not been set up.
+var ErrNotSetUp = errors.New("not a dropgitbox folder (run `dropgitbox setup` first)")
+
+// LoadOptions configures Load.
+type LoadOptions struct {
+	Logger *slog.Logger
+	// Token is used when the folder has no token of its own (the token
+	// from the user's config file).
+	Token string
+}
+
 // Load opens an already set-up synced folder at (or above) dir.
-func Load(dir string, log *slog.Logger) (*Syncer, error) {
+func Load(dir string, opts LoadOptions) (*Syncer, error) {
 	ctx := context.Background()
+	log := opts.Logger
 	if log == nil {
 		log = slog.Default()
 	}
@@ -217,7 +238,7 @@ func Load(dir string, log *slog.Logger) (*Syncer, error) {
 	probe := &gitx.Repo{Dir: abs}
 	top, err := probe.Run(ctx, "rev-parse", "--show-toplevel")
 	if err != nil {
-		return nil, fmt.Errorf("%s is not a dropgitbox folder (run `dropgitbox setup` first)", abs)
+		return nil, fmt.Errorf("%s: %w", abs, ErrNotSetUp)
 	}
 	g := &gitx.Repo{Dir: top}
 
@@ -229,7 +250,7 @@ func Load(dir string, log *slog.Logger) (*Syncer, error) {
 		return nil, err
 	}
 	if cfg.Server == "" || cfg.Repo == "" {
-		return nil, fmt.Errorf("%s is a git repository but not a dropgitbox folder (run `dropgitbox setup` first)", top)
+		return nil, fmt.Errorf("%s is a git repository but %w", top, ErrNotSetUp)
 	}
 	if cfg.Device, _ = g.Config(ctx, cfgDevice); cfg.Device == "" {
 		cfg.Device = hostname()
@@ -243,6 +264,9 @@ func Load(dir string, log *slog.Logger) (*Syncer, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
+	if cfg.Token == "" {
+		cfg.Token = opts.Token
+	}
 
 	g.Env = cfg.gitEnv()
 	return &Syncer{cfg: cfg, git: g, gitDir: gitDir, log: log.With("folder", top)}, nil
@@ -250,13 +274,42 @@ func Load(dir string, log *slog.Logger) (*Syncer, error) {
 
 // createRemoteRepo asks the server to create the repository (idempotent).
 func createRemoteRepo(ctx context.Context, cfg Config) error {
-	u := cfg.Server + "/api/v1/repos/" + url.PathEscape(cfg.Repo)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, nil)
+	err := apiCall(ctx, http.MethodPost, cfg.Server, "/api/v1/repos/"+url.PathEscape(cfg.Repo), cfg.Token, nil)
+	if err != nil {
+		return fmt.Errorf("creating repository on server: %w", err)
+	}
+	return nil
+}
+
+// RepoInfo describes a repository on the server.
+type RepoInfo struct {
+	Name string `json:"name"`
+	Head string `json:"head"`
+}
+
+// ListRepos lists the repositories on a server.
+func ListRepos(ctx context.Context, serverURL, token string) ([]RepoInfo, error) {
+	var repos []RepoInfo
+	err := apiCall(ctx, http.MethodGet, serverURL, "/api/v1/repos", token, &repos)
+	return repos, err
+}
+
+// WhoAmI returns the device name the server associates with token.
+func WhoAmI(ctx context.Context, serverURL, token string) (string, error) {
+	var resp struct {
+		Device string `json:"device"`
+	}
+	err := apiCall(ctx, http.MethodGet, serverURL, "/api/v1/whoami", token, &resp)
+	return resp.Device, err
+}
+
+func apiCall(ctx context.Context, method, serverURL, path, token string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(serverURL, "/")+path, nil)
 	if err != nil {
 		return err
 	}
-	if cfg.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	hc := &http.Client{Timeout: 30 * time.Second}
 	resp, err := hc.Do(req)
@@ -264,11 +317,17 @@ func createRemoteRepo(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("contacting server: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+	if resp.StatusCode/100 != 2 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("creating repository on server: %s: %s", resp.Status, bytes.TrimSpace(body))
+		if resp.StatusCode == http.StatusUnauthorized {
+			return fmt.Errorf("%s: the server rejected this device's token (was it revoked?)", resp.Status)
+		}
+		return fmt.Errorf("%s: %s", resp.Status, bytes.TrimSpace(body))
 	}
-	return nil
+	if out == nil {
+		return nil
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
 }
 
 func absGitDir(ctx context.Context, g *gitx.Repo) (string, error) {

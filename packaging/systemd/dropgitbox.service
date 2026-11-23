@@ -1,0 +1,18 @@
+# Per-user sync daemon. Enable with:
+#   systemctl --user enable --now dropgitbox
+# To keep syncing while logged out (e.g. on a headless machine):
+#   sudo loginctl enable-linger $USER
+[Unit]
+Description=dropgitbox sync daemon
+Documentation=https://github.com/dhruvasagar/dropgitbox
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/dropgitbox watch
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

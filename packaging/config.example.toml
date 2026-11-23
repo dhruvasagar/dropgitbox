@@ -1,0 +1,70 @@
+# dropgitbox configuration reference.
+#
+# Location (first found wins):
+#   -config FILE or $DROPGITBOX_CONFIG
+#   $XDG_CONFIG_HOME/dropgitbox/config.toml   (default ~/.config/dropgitbox/config.toml)
+#   $XDG_CONFIG_DIRS/dropgitbox/config.toml   (default /etc/xdg/dropgitbox/config.toml)
+#   /etc/dropgitbox/config.toml               (packaged server)
+#
+# Precedence: command-line flag > environment variable > this file > default.
+# Relative paths are relative to this file; "~/" and $VARS are expanded.
+# Run `dropgitbox config` to see which file is in use.
+
+# ---------------------------------------------------------------------------
+# Server node: `dropgitbox server` and `dropgitbox device ...`
+# ---------------------------------------------------------------------------
+[server]
+# Listen address.
+# addr = ":8080"
+
+# Where repositories and the device registry (devices.json) live.
+# Default: $XDG_DATA_HOME/dropgitbox (~/.local/share/dropgitbox).
+# data_dir = "/var/lib/dropgitbox"
+
+# URL devices use to reach the server; embedded in invites.
+# public_url = "https://box.example.com"
+
+# Serve HTTPS directly instead of behind a reverse proxy.
+# tls_cert = "/etc/dropgitbox/tls/cert.pem"
+# tls_key  = "/etc/dropgitbox/tls/key.pem"
+
+# Optional shared token accepted in addition to per-device tokens.
+# Prefer per-device tokens (`dropgitbox device add`), which can be revoked
+# individually. $DROPGITBOX_TOKEN also sets this.
+# token_file = "/etc/dropgitbox/shared-token"
+
+# Disable authentication entirely. Only on a fully trusted network.
+# no_auth = false
+
+# ---------------------------------------------------------------------------
+# Client device: join, setup, watch, sync, ...
+# `dropgitbox join INVITE` fills this in for you.
+# ---------------------------------------------------------------------------
+[client]
+# server = "https://box.example.com"
+
+# Name recorded in commit messages. Default: the hostname.
+# device = "laptop"
+
+# The device token. Default: the file "token" next to this config file
+# (kept separate so this file can live in a dotfiles repo).
+# $DROPGITBOX_TOKEN overrides it.
+# token_file = "token"
+
+# Daemon timing.
+# debounce = "2s"     # quiet period before committing a change
+# max_delay = "30s"   # longest a burst of changes can postpone a commit
+# poll = "5m"         # safety-net sync interval
+
+# ---------------------------------------------------------------------------
+# Synced folders. `dropgitbox setup` adds entries; `dropgitbox watch` syncs
+# all of them and sets up any that do not exist on this device yet. Copy
+# this list to a new device and they all appear there.
+# ---------------------------------------------------------------------------
+# [[folders]]
+# path = "~/Box"
+# repo = "Box"
+#
+# [[folders]]
+# path = "~/Documents/notes"
+# repo = "notes"

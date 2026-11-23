@@ -1,0 +1,14 @@
+# dropgitbox server configuration, used by dropgitbox-server.service.
+# Full reference: /usr/share/doc/dropgitbox/config.example.toml
+#
+# After editing: sudo systemctl restart dropgitbox-server
+# Add a device:  sudo dropgitbox device add NAME
+
+[server]
+addr = ":8080"
+data_dir = "/var/lib/dropgitbox"
+
+# The URL devices use to reach this server. It is embedded in invites, so
+# set it before running `dropgitbox device add`. See docs/deployment.md for
+# networking options (Tailscale, reverse proxy, ...).
+# public_url = "https://box.example.com"

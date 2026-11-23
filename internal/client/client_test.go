@@ -440,3 +440,44 @@ func TestServerRefusesHistoryRewrite(t *testing.T) {
 		t.Fatal("branch deletion should be rejected")
 	}
 }
+
+func TestRevokedDeviceGetsClearError(t *testing.T) {
+	isolateGit(t)
+	dataDir := t.TempDir()
+	srv, err := server.New(server.Options{DataDir: dataDir, Logger: quiet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	tok, err := server.AddDevice(dataDir, "phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := client.Setup(context.Background(), client.SetupOptions{
+		Dir: t.TempDir(), Server: ts.URL, Repo: "docs", Token: tok, TokenFromConfig: true, Logger: quiet,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// TokenFromConfig: the token is not copied into the folder...
+	if _, err := os.Stat(filepath.Join(s.Dir(), ".git", "dropgitbox-token")); !os.IsNotExist(err) {
+		t.Fatalf("token copied into folder: %v", err)
+	}
+	// ...but a fresh Load picks it up from the caller (the config file).
+	s, err = client.Load(s.Dir(), client.LoadOptions{Logger: quiet, Token: tok})
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, s, "f.txt", "x\n")
+	mustSync(t, s)
+
+	if err := server.RevokeDevice(dataDir, "phone"); err != nil {
+		t.Fatal(err)
+	}
+	write(t, s, "f.txt", "y\n")
+	if err := s.Sync(context.Background()); !errors.Is(err, client.ErrUnauthorized) {
+		t.Fatalf("want ErrUnauthorized, got %v", err)
+	}
+}

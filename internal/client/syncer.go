@@ -19,6 +19,23 @@ import (
 // resolves it, so conflict markers never get committed by accident.
 var ErrConflict = errors.New("unresolved merge conflict; syncing is paused until it is resolved")
 
+// ErrUnauthorized is returned when the server rejects this device's token.
+var ErrUnauthorized = errors.New("the server rejected this device's token (was the device revoked? get a new invite with `dropgitbox device add` and run `dropgitbox join -force`)")
+
+// network wraps errors from git commands that talk to the server, turning
+// authentication failures into ErrUnauthorized.
+func network(err error) error {
+	var ge *gitx.Error
+	if errors.As(err, &ge) {
+		msg := ge.Stderr
+		if strings.Contains(msg, "could not read Username") || strings.Contains(msg, "Authentication failed") ||
+			strings.Contains(msg, "returned error: 401") {
+			return ErrUnauthorized
+		}
+	}
+	return err
+}
+
 // maxPushAttempts bounds the fetch/merge/push loop when other devices keep
 // pushing in between our fetch and our push.
 const maxPushAttempts = 5
@@ -78,7 +95,7 @@ func (s *Syncer) Sync(ctx context.Context) error {
 
 	for range maxPushAttempts {
 		if _, err := s.git.Run(ctx, "fetch", "--quiet", "--prune", "origin"); err != nil {
-			return err
+			return network(err)
 		}
 		remote, err := s.git.RevParse(ctx, "refs/remotes/origin/"+Branch)
 		if err != nil {
@@ -114,7 +131,7 @@ func (s *Syncer) Sync(ctx context.Context) error {
 				s.log.Debug("push raced with another device, retrying")
 				continue
 			}
-			return err
+			return network(err)
 		}
 		s.log.Info("pushed", "head", short(local))
 		return nil
