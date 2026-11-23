@@ -13,6 +13,7 @@ import (
 	"runtime/debug"
 	"syscall"
 
+	"github.com/dhruvasagar/dropgitbox/internal/client"
 	"github.com/dhruvasagar/dropgitbox/internal/config"
 )
 
@@ -83,6 +84,7 @@ func main() {
 	case "-v", "--version":
 		cmd = "version"
 	}
+	client.Version = version
 	run, ok := commands[cmd]
 	if !ok {
 		fmt.Fprintf(os.Stderr, "dropgitbox: unknown command %q\n\n%s", cmd, usage)

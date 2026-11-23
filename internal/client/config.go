@@ -68,17 +68,27 @@ func (c Config) EventsURL() string {
 	return strings.TrimRight(c.Server, "/") + "/api/v1/repos/" + url.PathEscape(c.Repo) + "/events"
 }
 
-// gitEnv passes the token to git through environment-provided config, so it
-// never appears in the remote URL, .git/config, or the process list.
+// Version is reported to the server in the User-Agent. main sets it.
+var Version = "dev"
+
+func userAgent() string { return "dropgitbox/" + Version }
+
+// gitEnv passes settings to git through environment-provided config: the
+// token (so it never appears in the remote URL, .git/config, or the
+// process list) and the user agent.
 func (c Config) gitEnv() []string {
+	env := []string{
+		"GIT_CONFIG_KEY_0=http.userAgent",
+		"GIT_CONFIG_VALUE_0=" + userAgent(),
+	}
 	if c.Token == "" {
-		return nil
+		return append(env, "GIT_CONFIG_COUNT=1")
 	}
-	return []string{
-		"GIT_CONFIG_COUNT=1",
-		"GIT_CONFIG_KEY_0=http.extraHeader",
-		"GIT_CONFIG_VALUE_0=Authorization: Bearer " + c.Token,
-	}
+	return append(env,
+		"GIT_CONFIG_KEY_1=http.extraHeader",
+		"GIT_CONFIG_VALUE_1=Authorization: Bearer "+c.Token,
+		"GIT_CONFIG_COUNT=2",
+	)
 }
 
 // SetupOptions configures Setup.
@@ -274,7 +284,7 @@ func Load(dir string, opts LoadOptions) (*Syncer, error) {
 
 // createRemoteRepo asks the server to create the repository (idempotent).
 func createRemoteRepo(ctx context.Context, cfg Config) error {
-	err := apiCall(ctx, http.MethodPost, cfg.Server, "/api/v1/repos/"+url.PathEscape(cfg.Repo), cfg.Token, nil)
+	err := apiCall(ctx, http.MethodPost, cfg.Server, "/api/v1/repos/"+url.PathEscape(cfg.Repo), cfg.Token, nil, nil)
 	if err != nil {
 		return fmt.Errorf("creating repository on server: %w", err)
 	}
@@ -290,7 +300,7 @@ type RepoInfo struct {
 // ListRepos lists the repositories on a server.
 func ListRepos(ctx context.Context, serverURL, token string) ([]RepoInfo, error) {
 	var repos []RepoInfo
-	err := apiCall(ctx, http.MethodGet, serverURL, "/api/v1/repos", token, &repos)
+	err := apiCall(ctx, http.MethodGet, serverURL, "/api/v1/repos", token, nil, &repos)
 	return repos, err
 }
 
@@ -299,14 +309,26 @@ func WhoAmI(ctx context.Context, serverURL, token string) (string, error) {
 	var resp struct {
 		Device string `json:"device"`
 	}
-	err := apiCall(ctx, http.MethodGet, serverURL, "/api/v1/whoami", token, &resp)
+	err := apiCall(ctx, http.MethodGet, serverURL, "/api/v1/whoami", token, nil, &resp)
 	return resp.Device, err
 }
 
-func apiCall(ctx context.Context, method, serverURL, path, token string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(serverURL, "/")+path, nil)
+func apiCall(ctx context.Context, method, serverURL, path, token string, body, out any) error {
+	var rd io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		rd = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(serverURL, "/")+path, rd)
 	if err != nil {
 		return err
+	}
+	req.Header.Set("User-Agent", userAgent())
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)

@@ -34,6 +34,7 @@ type Device struct {
 	Name      string    `json:"name"`
 	TokenHash string    `json:"token_sha256"`
 	Created   time.Time `json:"created"`
+	Rotated   time.Time `json:"rotated,omitzero"`
 }
 
 type deviceFile struct {
@@ -88,6 +89,31 @@ func AddDevice(dataDir, name string) (string, error) {
 		return "", err
 	}
 	df.Devices = append(df.Devices, Device{Name: name, TokenHash: hashToken(token), Created: time.Now().UTC().Truncate(time.Second)})
+	if err := writeDevices(dataDir, path, df); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+// RotateDevice replaces a device's token: the old one stops working
+// immediately and the new one is returned. Use it when a token may have
+// leaked but the device itself is fine.
+func RotateDevice(dataDir, name string) (string, error) {
+	path := filepath.Join(dataDir, DevicesFile)
+	df, err := readDevices(path)
+	if err != nil {
+		return "", err
+	}
+	i := slices.IndexFunc(df.Devices, func(d Device) bool { return d.Name == name })
+	if i < 0 {
+		return "", fmt.Errorf("%w: %s", ErrNoSuchDevice, name)
+	}
+	token, err := NewToken()
+	if err != nil {
+		return "", err
+	}
+	df.Devices[i].TokenHash = hashToken(token)
+	df.Devices[i].Rotated = time.Now().UTC().Truncate(time.Second)
 	if err := writeDevices(dataDir, path, df); err != nil {
 		return "", err
 	}

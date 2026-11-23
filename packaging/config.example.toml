@@ -33,6 +33,12 @@
 # individually. $DROPGITBOX_TOKEN also sets this.
 # token_file = "/etc/dropgitbox/shared-token"
 
+# Reverse proxies whose X-Forwarded-For header is believed, so that logs
+# and brute-force blocking see the real client address. IPs or CIDRs.
+# Default: loopback only (a proxy on the same machine). Never list
+# addresses that untrusted clients can connect from.
+# trusted_proxies = ["127.0.0.1/32", "::1/128"]
+
 # Disable authentication entirely. Only on a fully trusted network.
 # no_auth = false
 

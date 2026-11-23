@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/dhruvasagar/dropgitbox/internal/server"
 )
+
+var errStreamUnauthorized = errors.New("server rejected this device's token")
 
 // subscribe listens to the server's push notifications for the folder and
 // calls onHead with the server's branch head on connect and after every
@@ -25,6 +28,11 @@ func subscribe(ctx context.Context, cfg Config, idleTimeout time.Duration, log *
 		}
 		if connected {
 			backoff = time.Second
+		}
+		if errors.Is(err, errStreamUnauthorized) {
+			// A revoked or wrong token won't start working by retrying
+			// quickly; don't count towards the server's lockout.
+			backoff = 5 * time.Minute
 		}
 		log.Warn("event stream disconnected; retrying", "err", err, "in", backoff)
 		select {
@@ -47,6 +55,7 @@ func streamEvents(ctx context.Context, cfg Config, idleTimeout time.Duration, on
 		return false, err
 	}
 	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("User-Agent", userAgent())
 	if cfg.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+cfg.Token)
 	}
@@ -55,6 +64,9 @@ func streamEvents(ctx context.Context, cfg Config, idleTimeout time.Duration, on
 		return false, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return false, errStreamUnauthorized
+	}
 	if resp.StatusCode != http.StatusOK {
 		return false, fmt.Errorf("server returned %s", resp.Status)
 	}

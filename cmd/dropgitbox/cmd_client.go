@@ -139,6 +139,7 @@ func cmdJoin(ctx context.Context, args []string) error {
 		return fmt.Errorf("%s sets client.token inline; remove it so the new token can be used", cfg.Path())
 	}
 
+	warnInsecure(inv.Server)
 	who, err := client.WhoAmI(ctx, inv.Server, inv.Token)
 	if err != nil {
 		return fmt.Errorf("checking the invite with %s: %w", inv.Server, err)
@@ -253,6 +254,7 @@ func cmdSetup(ctx context.Context, args []string) error {
 		}
 	}
 
+	warnInsecure(*srvURL)
 	s, err := e.setup(ctx, abs, *repo, *srvURL, tok, fromConfig, *device)
 	if err != nil && !errors.Is(err, client.ErrConflict) {
 		return err
@@ -515,6 +517,13 @@ To resolve (in %[1]s), either:
   - keep this device's version:   dropgitbox resolve -ours [PATH...]
   - keep the server's version:    dropgitbox resolve -theirs [PATH...]
 `, s.Dir())
+}
+
+func warnInsecure(serverURL string) {
+	if client.InsecureURL(serverURL) {
+		fmt.Fprintf(os.Stderr, "dropgitbox: warning: %s uses plain HTTP, so this device's token and files travel unencrypted.\n"+
+			"  That is only safe on a trusted LAN or inside a VPN such as WireGuard or Tailscale; otherwise use https://.\n", serverURL)
+	}
 }
 
 func orNone(s string) string {

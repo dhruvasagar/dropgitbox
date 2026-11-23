@@ -17,6 +17,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -62,6 +63,9 @@ type Server struct {
 	NoAuth    bool   `toml:"no_auth"`    // disable authentication entirely
 	TLSCert   string `toml:"tls_cert"`   // serve HTTPS directly with this certificate...
 	TLSKey    string `toml:"tls_key"`    // ...and key
+	// TrustedProxies are CIDRs of reverse proxies whose X-Forwarded-For
+	// header is believed. Default: loopback only.
+	TrustedProxies []string `toml:"trusted_proxies"`
 }
 
 // Client configures the sync client.
@@ -255,7 +259,7 @@ func (c *Config) Resolve(p string) string {
 // device add` work on a machine that is both a client and a server.
 func LoadServer(explicit string) (*Config, error) {
 	c, err := Load(explicit)
-	if err != nil || c.explicit || c.Server != (Server{}) || c.path == SystemPath {
+	if err != nil || c.explicit || !reflect.ValueOf(c.Server).IsZero() || c.path == SystemPath {
 		return c, err
 	}
 	if _, err := os.Stat(SystemPath); err != nil {

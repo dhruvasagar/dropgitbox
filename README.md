@@ -129,16 +129,32 @@ device's `~/.config/dropgitbox/config.toml` to the new one. The file holds
 no secrets and uses `~` paths, so it suits a dotfiles repo. Then run
 `join` and `dropgitbox watch`, which sets up every listed folder.
 
-Manage devices on the server: `sudo dropgitbox device list`, and
-`sudo dropgitbox device revoke laptop`. Revocation takes effect
-immediately, with no restart.
+### 3. Manage devices (on the server)
+
+```console
+$ sudo dropgitbox device list
+DEVICE   LAST SEEN  LAST PUSH  STATUS           VERSION  ADDED
+laptop   just now   2m ago     in sync          0.1.0    2026-11-23
+desktop  5m ago     1h ago     CONFLICT in Box  0.1.0    2026-11-23
+
+$ sudo dropgitbox device show desktop     # per-folder state, heads, conflicted files, last error
+$ sudo dropgitbox device rotate laptop    # new token + invite; the old token stops working
+$ sudo dropgitbox device revoke desktop   # cut the device off
+```
+
+Each client reports to the server after every sync attempt: synced, paused
+on a conflict, or failed with an error. Together with the server's own
+record of each device's last request, fetch and push, `list` and `show`
+tell you which devices are healthy and which need attention. Rotation and
+revocation take effect immediately, with no restart, and close the
+device's open connections.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
 | `server` | Run the server (`-addr`, `-data`, `-tls-cert/-tls-key`, `-no-auth`, `-v`) |
-| `device add NAME` / `list` / `revoke NAME` | Manage devices (run on the server node) |
+| `device add\|list\|show\|rotate\|revoke` | Manage devices: invite, inspect sync status, replace a token, revoke (run on the server node) |
 | `join INVITE` | Connect this device to a server |
 | `repos` | List folders on the server, and where each one is synced locally |
 | `setup -repo NAME -dir DIR` | Start syncing a folder, and register it in the config |
@@ -235,12 +251,57 @@ every device, at the address in `public_url`. Typical choices:
 including proxy configs. Reverse proxies need streaming enabled, and nginx
 needs `client_max_body_size 0`.
 
+## Security
+
+The server is designed to be exposed publicly, behind TLS:
+
+- **Every route except `/healthz` requires a valid token.** This is checked
+  before anything else, so without one you cannot even learn which folders
+  exist. Device tokens are 256-bit random values, stored on the server only
+  as SHA-256 hashes. An optional shared token must be at least 24
+  characters.
+- **Brute-force protection.** A client that presents 20 invalid tokens
+  within 5 minutes is blocked for 15 minutes (HTTP 429). IPv6 clients are
+  grouped per /64. Requests without credentials, such as git's first
+  anonymous probe, don't count. Every failure is logged with the client's
+  address, so tools like fail2ban can also block at the firewall (see
+  [docs/deployment.md](docs/deployment.md#hardening-a-public-server)).
+- **Real client addresses behind a proxy.** `X-Forwarded-For` is believed
+  only from `server.trusted_proxies` (default: loopback), using the
+  rightmost untrusted address, so clients cannot spoof their address.
+- **Minimal git surface.** Only git's three smart-HTTP endpoints are
+  served. Raw repository files, the legacy "dumb" protocol, and paths
+  outside a repository return 404. History protection is enforced for
+  every repository regardless of its own config: no force-pushes, no
+  branch deletion, and `receive.fsckObjects` checks the integrity of
+  everything pushed.
+- **Hardened HTTP.** Header and idle timeouts, a 64 KiB header limit,
+  TLS 1.2+ when serving TLS directly, size limits on API request bodies, a
+  per-device cap on open event streams, no internal details in error
+  responses, and conservative security headers (`nosniff`, `no-store`,
+  `frame-ancestors 'none'`).
+- **Revocation is immediate.** `device revoke` and `device rotate` take
+  effect on the next request, and close the device's open event streams.
+- **Sandboxed service.** The packaged systemd unit runs as an ephemeral
+  unprivileged user, with a read-only system, no home directories, and no
+  capabilities.
+- **Clients** keep tokens in 0600 files and pass them to git through the
+  environment, never in URLs, `.git/config`, or process arguments. They
+  warn when a server URL uses plain HTTP.
+
+What a token holder can do: any valid device token can read and write
+every folder on the server, because this is a single-user design. Revoke
+lost devices promptly. History cannot be destroyed through the server, so
+even a compromised device can only add commits, and every earlier version
+stays recoverable.
+
 ## Server API
 
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /healthz` | Liveness check (no auth) |
 | `GET /api/v1/whoami` | The device a token belongs to |
+| `POST /api/v1/status` | A client reports its sync state for a folder (`ok`, `conflict`, `error`) |
 | `GET /api/v1/repos` | List repositories and their heads |
 | `GET /api/v1/repos/{name}` | One repository's head |
 | `POST /api/v1/repos/{name}` | Create a repository (idempotent) |

@@ -18,7 +18,7 @@ import (
 	"github.com/dhruvasagar/dropgitbox/internal/server"
 )
 
-const token = "s3cret"
+const token = "test-shared-token-0123456789"
 
 var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -479,5 +479,93 @@ func TestRevokedDeviceGetsClearError(t *testing.T) {
 	write(t, s, "f.txt", "y\n")
 	if err := s.Sync(context.Background()); !errors.Is(err, client.ErrUnauthorized) {
 		t.Fatalf("want ErrUnauthorized, got %v", err)
+	}
+}
+
+func TestServerRecordsDeviceActivity(t *testing.T) {
+	isolateGit(t)
+	dataDir := t.TempDir()
+	srv, err := server.New(server.Options{DataDir: dataDir, Logger: quiet, ActivityFlush: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	setupDev := func(name string) *client.Syncer {
+		tok, err := server.AddDevice(dataDir, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, err := client.Setup(context.Background(), client.SetupOptions{
+			Dir: t.TempDir(), Server: ts.URL, Repo: "docs", Token: tok, Device: name, Logger: quiet,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	a, b := setupDev("a"), setupDev("b")
+	write(t, a, "f.txt", "1\n")
+	mustSync(t, a)
+	write(t, a, "f.txt", "a\n")
+	write(t, b, "f.txt", "b\n")
+	mustSync(t, a)
+	if err := b.Sync(context.Background()); !errors.Is(err, client.ErrConflict) {
+		t.Fatalf("want conflict: %v", err)
+	}
+
+	act := srv.Activity()
+	ra, rb := act["a"].Repos["docs"], act["b"].Repos["docs"]
+	if ra.State != server.StateOK || ra.LastPush.IsZero() || ra.LastFetch.IsZero() {
+		t.Fatalf("a = %+v", ra)
+	}
+	head, _ := a.Head(context.Background())
+	if ra.Head != head || ra.PushHead != head {
+		t.Fatalf("a head %s, reported %s, pushed %s", head, ra.Head, ra.PushHead)
+	}
+	if rb.State != server.StateConflict || len(rb.Conflicts) != 1 || rb.Conflicts[0] != "f.txt" {
+		t.Fatalf("b = %+v", rb)
+	}
+	if act["a"].ClientVersion == "" {
+		t.Fatal("client version not recorded")
+	}
+}
+
+// History protection is enforced server-wide, even if a repository's own
+// config is weakened.
+func TestHistoryProtectionIgnoresRepoConfig(t *testing.T) {
+	isolateGit(t)
+	dataDir := t.TempDir()
+	srv, err := server.New(server.Options{DataDir: dataDir, Token: token, Logger: quiet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	a, err := client.Setup(context.Background(), client.SetupOptions{Dir: t.TempDir(), Server: ts.URL, Repo: "docs", Token: token, Logger: quiet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, a, "f.txt", "1\n")
+	mustSync(t, a)
+	write(t, a, "f.txt", "2\n")
+	mustSync(t, a)
+
+	bare := &gitx.Repo{Dir: filepath.Join(dataDir, "docs.git")}
+	ctx := context.Background()
+	for _, k := range []string{"receive.denyNonFastForwards", "receive.denyDeletes"} {
+		if err := bare.SetConfig(ctx, k, "false"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	g := a.Git()
+	if _, err := g.Run(ctx, "reset", "--hard", "HEAD~1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Run(ctx, "push", "--force", "origin", "HEAD:refs/heads/main"); err == nil {
+		t.Fatal("force push accepted after weakening repo config")
+	}
+	if _, err := g.Run(ctx, "push", "origin", ":refs/heads/main"); err == nil {
+		t.Fatal("branch deletion accepted after weakening repo config")
 	}
 }

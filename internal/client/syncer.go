@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/dhruvasagar/dropgitbox/internal/gitx"
+	"github.com/dhruvasagar/dropgitbox/internal/server"
 )
 
 // ErrConflict is returned while the folder has an unresolved merge
@@ -82,7 +83,36 @@ func (s *Syncer) ConflictedFiles(ctx context.Context) ([]string, error) {
 
 // Sync commits all local changes, merges in changes from the server and
 // pushes the result. It returns ErrConflict if the merge needs the user.
+// The outcome is reported to the server (best effort), so the server's
+// `dropgitbox device list` shows each device's sync state.
 func (s *Syncer) Sync(ctx context.Context) error {
+	err := s.sync(ctx)
+	s.report(ctx, err)
+	return err
+}
+
+// report tells the server how the last sync went.
+func (s *Syncer) report(ctx context.Context, syncErr error) {
+	if errors.Is(syncErr, ErrUnauthorized) || ctx.Err() != nil {
+		return
+	}
+	rep := server.StatusReport{Repo: s.cfg.Repo, State: server.StateOK}
+	switch {
+	case errors.Is(syncErr, ErrConflict):
+		rep.State = server.StateConflict
+		rep.Conflicts, _ = s.ConflictedFiles(ctx)
+	case syncErr != nil:
+		rep.State, rep.Message = server.StateError, syncErr.Error()
+	}
+	rep.Head, _ = s.Head(ctx)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := apiCall(ctx, "POST", s.cfg.Server, "/api/v1/status", s.cfg.Token, rep, nil); err != nil {
+		s.log.Debug("could not report status to server", "err", err)
+	}
+}
+
+func (s *Syncer) sync(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

@@ -109,13 +109,13 @@ func TestNoAuthAndSharedToken(t *testing.T) {
 		t.Fatalf("no-auth server: %d", code)
 	}
 
-	shared, err := New(Options{DataDir: t.TempDir(), Token: "shh", Logger: quiet})
+	shared, err := New(Options{DataDir: t.TempDir(), Token: "a-long-enough-shared-token", Logger: quiet})
 	if err != nil {
 		t.Fatal(err)
 	}
 	ts2 := httptest.NewServer(shared.Handler())
 	defer ts2.Close()
-	if code := get(t, ts2.URL+"/api/v1/repos", "shh"); code != http.StatusOK {
+	if code := get(t, ts2.URL+"/api/v1/repos", "a-long-enough-shared-token"); code != http.StatusOK {
 		t.Fatalf("shared token: %d", code)
 	}
 	if code := get(t, ts2.URL+"/api/v1/repos", ""); code != http.StatusUnauthorized {
@@ -156,5 +156,90 @@ func TestRevokeClosesOpenEventStream(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("event stream stayed open after revocation")
+	}
+}
+
+func TestRotateReplacesToken(t *testing.T) {
+	dir := t.TempDir()
+	srv, err := New(Options{DataDir: dir, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	old, _ := AddDevice(dir, "laptop")
+	fresh, err := RotateDevice(dir, "laptop")
+	if err != nil || fresh == old {
+		t.Fatalf("rotate: %q %v", fresh, err)
+	}
+	if code := get(t, ts.URL+"/api/v1/whoami", old); code != http.StatusUnauthorized {
+		t.Fatalf("old token still works: %d", code)
+	}
+	if code := get(t, ts.URL+"/api/v1/whoami", fresh); code != http.StatusOK {
+		t.Fatalf("new token rejected: %d", code)
+	}
+	devs, _ := ListDevices(dir)
+	if len(devs) != 1 || devs[0].Rotated.IsZero() {
+		t.Fatalf("devices after rotate: %+v", devs)
+	}
+	if _, err := RotateDevice(dir, "ghost"); !errors.Is(err, ErrNoSuchDevice) {
+		t.Fatalf("rotate unknown: %v", err)
+	}
+}
+
+func TestStatusReportsAreRecordedAndValidated(t *testing.T) {
+	dir := t.TempDir()
+	srv, err := New(Options{DataDir: dir, ActivityFlush: time.Hour, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	tok, _ := AddDevice(dir, "laptop")
+	post := func(path, body string) int {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("User-Agent", "dropgitbox/1.2.3")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	post("/api/v1/repos/docs", "")
+	if c := post("/api/v1/status", `{"repo":"docs","state":"conflict","conflicts":["a.txt"],"head":"abc"}`); c != http.StatusNoContent {
+		t.Fatalf("report: %d", c)
+	}
+	for body, want := range map[string]int{
+		`{"repo":"docs","state":"hacked"}`: http.StatusBadRequest,
+		`{"repo":"../etc","state":"ok"}`:   http.StatusNotFound,
+		`{"repo":"missing","state":"ok"}`:  http.StatusNotFound,
+		`not json`:                         http.StatusBadRequest,
+		`{"repo":"docs","state":"ok","message":"` + strings.Repeat("x", 70000) + `"}`: http.StatusBadRequest,
+	} {
+		if c := post("/api/v1/status", body); c != want {
+			t.Errorf("body %.40q: %d, want %d", body, c, want)
+		}
+	}
+
+	// Close flushes to disk; the CLI reads the file.
+	srv.Close()
+	act, err := ReadActivity(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := act["laptop"]
+	if d == nil || d.ClientVersion != "1.2.3" || d.LastSeen.IsZero() || d.LastIP == "" {
+		t.Fatalf("activity = %+v", d)
+	}
+	r := d.Repos["docs"]
+	if r == nil || r.State != StateConflict || len(r.Conflicts) != 1 || r.Head != "abc" {
+		t.Fatalf("repo activity = %+v", r)
+	}
+	if fi, _ := os.Stat(filepath.Join(dir, ActivityFile)); fi.Mode().Perm() != 0o600 {
+		t.Fatalf("activity perms = %v", fi.Mode().Perm())
 	}
 }

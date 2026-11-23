@@ -95,6 +95,7 @@ server {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_buffering off;         # needed for the event stream
         proxy_request_buffering off; # stream large pushes
         proxy_read_timeout 1h;       # event streams are long-lived
@@ -211,15 +212,83 @@ dotfiles-friendly: no secrets, and paths use `~`). On the new device, run
 Manage devices on the server:
 
 ```sh
-sudo dropgitbox device list
+sudo dropgitbox device list              # last seen, last push, sync status, version
+sudo dropgitbox device show laptop       # per-folder detail: state, conflicts, last error
+sudo dropgitbox device rotate laptop     # new token and invite; the old one stops working
 sudo dropgitbox device revoke laptop     # takes effect immediately, no restart
 ```
 
 Revoking stops a device from syncing. It does not erase the copy already on
 that device.
 
-## 4. Operations
+## 4. Hardening a public server
 
+dropgitbox already rejects requests without a valid token and blocks
+clients that keep presenting bad ones (see the Security section of the
+README). On a public server, also do the following.
+
+**Make sure the server sees real client addresses.** With the proxy on
+the same machine and dropgitbox on `127.0.0.1`, the defaults are correct.
+Caddy sets `X-Forwarded-For` automatically; for nginx, include the
+`proxy_set_header X-Forwarded-For` line above. If the proxy runs on
+another machine, list its address:
+
+```toml
+[server]
+trusted_proxies = ["10.0.0.5"]
+```
+
+Check by sending a bad token from outside and reading the log. The `ip=`
+field must show your address, not the proxy's:
+
+```sh
+curl -s -H 'Authorization: Bearer dgb_wrong' https://box.example.com/api/v1/repos
+journalctl -u dropgitbox-server | grep 'auth failed'
+# ... level=WARN msg="auth failed: invalid token" ip=203.0.113.50 method=GET path=/api/v1/repos user_agent=curl/8.x
+```
+
+**Bind to localhost** (`addr = "127.0.0.1:8080"`) so the only way in is
+through the proxy and its TLS.
+
+**Optionally, ban at the firewall with fail2ban.** The built-in limiter
+blocks for 15 minutes; fail2ban can ban for longer and drop the traffic
+before it reaches the proxy.
+
+`/etc/fail2ban/filter.d/dropgitbox.conf`:
+
+```ini
+[Definition]
+failregex = msg="auth failed: invalid token" ip=<HOST>
+journalmatch = _SYSTEMD_UNIT=dropgitbox-server.service
+```
+
+`/etc/fail2ban/jail.d/dropgitbox.local`:
+
+```ini
+[dropgitbox]
+enabled  = true
+backend  = systemd
+filter   = dropgitbox
+maxretry = 10
+findtime = 10m
+bantime  = 1d
+# The proxy terminates connections, so ban on ports 80/443.
+port     = http,https
+```
+
+**Keep tokens tight.** Give every device its own token
+(`dropgitbox device add`). Rotate one you suspect has leaked
+(`dropgitbox device rotate NAME`, then `join -force` on the device), and
+revoke lost devices (`dropgitbox device revoke NAME`). Check
+`dropgitbox device list` now and then for devices you don't recognise or
+that have gone quiet.
+
+## 5. Operations
+
+- **Device health.** `sudo dropgitbox device list` shows each device's last
+  contact, last push, client version, and whether it is in sync, paused on
+  a conflict, or failing. `sudo dropgitbox device show NAME` has the
+  per-folder detail.
 - **Logs.** Server: `journalctl -u dropgitbox-server`. Client:
   `journalctl --user -u dropgitbox` on Linux, `~/Library/Logs/dropgitbox.log`
   on macOS.

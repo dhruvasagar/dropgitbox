@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 )
@@ -24,6 +25,21 @@ type Invite struct {
 func (i Invite) Encode() string {
 	b, _ := json.Marshal(i)
 	return invitePrefix + base64.RawURLEncoding.EncodeToString(b)
+}
+
+// InsecureURL reports whether serverURL sends tokens unencrypted to
+// another machine (plain http to a non-loopback host).
+func InsecureURL(serverURL string) bool {
+	u, err := url.Parse(serverURL)
+	if err != nil || u.Scheme != "http" {
+		return false
+	}
+	h := u.Hostname()
+	if h == "localhost" {
+		return false
+	}
+	ip := net.ParseIP(h)
+	return ip == nil || !ip.IsLoopback()
 }
 
 // DecodeInvite parses an invite produced by Encode.

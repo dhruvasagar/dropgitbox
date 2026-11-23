@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -26,6 +29,7 @@ type serverSettings struct {
 	noAuth  bool
 	tlsCert string
 	tlsKey  string
+	trusted []netip.Prefix
 }
 
 func cmdServer(ctx context.Context, args []string) error {
@@ -63,7 +67,9 @@ func cmdServer(ctx context.Context, args []string) error {
 	}
 
 	log := newLogger(*verbose)
-	srv, err := server.New(server.Options{DataDir: st.dataDir, Token: st.token, NoAuth: st.noAuth, Logger: log})
+	srv, err := server.New(server.Options{
+		DataDir: st.dataDir, Token: st.token, NoAuth: st.noAuth, Logger: log, TrustedProxies: st.trusted,
+	})
 	if err != nil {
 		return err
 	}
@@ -76,9 +82,15 @@ func cmdServer(ctx context.Context, args []string) error {
 	}
 
 	hs := &http.Server{
-		Addr:              st.addr,
-		Handler:           srv.Handler(),
+		Addr:    st.addr,
+		Handler: srv.Handler(),
+		// No overall read/write timeouts: pushes of large files and event
+		// streams are legitimately long. Slow or idle clients are bounded by
+		// these instead.
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    64 << 10,
+		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12},
 		// Long-lived event streams end when the server shuts down.
 		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
@@ -100,7 +112,9 @@ func cmdServer(ctx context.Context, args []string) error {
 	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return hs.Shutdown(shutdownCtx)
+	err = hs.Shutdown(shutdownCtx)
+	srv.Close() // flush device activity
+	return err
 }
 
 // loadServerSettings resolves server settings from the config file and
@@ -125,6 +139,17 @@ func loadServerSettings(cfgPath, dataFlag string) (*serverSettings, error) {
 	if st.addr == "" {
 		st.addr = ":8080"
 	}
+	for _, c := range sc.TrustedProxies {
+		p, err := netip.ParsePrefix(c)
+		if err != nil {
+			a, aerr := netip.ParseAddr(c)
+			if aerr != nil {
+				return nil, fmt.Errorf("server.trusted_proxies: %q is not an IP or CIDR", c)
+			}
+			p = netip.PrefixFrom(a, a.BitLen())
+		}
+		st.trusted = append(st.trusted, p)
+	}
 	switch {
 	case dataFlag != "":
 		st.dataDir = config.ExpandHome(dataFlag)
@@ -146,7 +171,9 @@ func loadServerSettings(cfgPath, dataFlag string) (*serverSettings, error) {
 func cmdDevice(ctx context.Context, args []string) error {
 	const help = `usage:
   dropgitbox device add NAME [-url URL]   register a device and print its invite
-  dropgitbox device list                  list registered devices
+  dropgitbox device list                  list devices with last activity and sync status
+  dropgitbox device show NAME             per-folder detail for one device
+  dropgitbox device rotate NAME [-url URL] replace a device's token (prints a new invite)
   dropgitbox device revoke NAME           revoke a device's access immediately
 
 Run these on the server node, as the server's user or with sudo.`
@@ -167,59 +194,282 @@ Run these on the server node, as the server's user or with sudo.`
 	if isSet(fs, "url") {
 		st.url = *pubURL
 	}
+	oneName := func(usage string) (string, error) {
+		if len(pos) != 1 {
+			return "", errors.New("usage: dropgitbox device " + usage)
+		}
+		return pos[0], nil
+	}
+	needURL := func() error {
+		if st.url == "" {
+			return errors.New("the server's public URL is unknown; pass -url https://box.example.com or set server.public_url in " + configHint(st.cfg))
+		}
+		return nil
+	}
 
 	switch sub {
 	case "add":
-		if len(pos) != 1 {
-			return errors.New("usage: dropgitbox device add NAME [-url URL]")
+		name, err := oneName("add NAME [-url URL]")
+		if err != nil {
+			return err
 		}
-		if st.url == "" {
-			return errors.New("device add: the server's public URL is unknown; pass -url https://box.example.com or set server.public_url in " + configHint(st.cfg))
+		if err := needURL(); err != nil {
+			return err
 		}
-		name := pos[0]
 		token, err := server.AddDevice(st.dataDir, name)
 		if err != nil {
 			return err
 		}
-		inv := client.Invite{Server: strings.TrimRight(st.url, "/"), Token: token, Device: name}
-		fmt.Printf(`Registered device %q.
+		fmt.Printf("Registered device %q.\n\n", name)
+		printInvite(st.url, token, name)
+		return nil
 
-On that device, install dropgitbox and run:
+	case "rotate":
+		name, err := oneName("rotate NAME [-url URL]")
+		if err != nil {
+			return err
+		}
+		if err := needURL(); err != nil {
+			return err
+		}
+		token, err := server.RotateDevice(st.dataDir, name)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Issued a new token for %q; the old one no longer works.\n\n", name)
+		printInvite(st.url, token, name)
+		fmt.Println("(On that device run the join command with -force to replace the old token. Its folders stay as they are.)")
+		return nil
+
+	case "list", "ls":
+		return listDevices(ctx, st)
+
+	case "show":
+		name, err := oneName("show NAME")
+		if err != nil {
+			return err
+		}
+		return showDevice(ctx, st, name)
+
+	case "revoke", "remove", "rm":
+		name, err := oneName("revoke NAME")
+		if err != nil {
+			return err
+		}
+		if err := server.RevokeDevice(st.dataDir, name); err != nil {
+			return err
+		}
+		fmt.Printf("Revoked %q. Its token no longer works and its open connections are closed;\nthe files already on that device stay there.\n", name)
+		return nil
+	}
+	return fmt.Errorf("unknown device command %q\n\n%s", sub, help)
+}
+
+func printInvite(serverURL, token, name string) {
+	inv := client.Invite{Server: strings.TrimRight(serverURL, "/"), Token: token, Device: name}
+	fmt.Printf(`On that device, install dropgitbox and run:
 
   dropgitbox join %s
 
 The invite contains the device's access token: send it over a private
 channel. To cut the device off later: dropgitbox device revoke %s
-`, name, inv.Encode(), name)
-		return nil
+`, inv.Encode(), name)
+}
 
-	case "list":
-		devices, err := server.ListDevices(st.dataDir)
-		if err != nil {
-			return err
+// deviceStatus summarises a device's folders in a few words.
+func deviceStatus(ctx context.Context, st *serverSettings, act *server.DeviceActivity) string {
+	if act == nil || len(act.Repos) == 0 {
+		return "never synced"
+	}
+	var conflicts, errs, behind, ok []string
+	for _, name := range sortedKeys(act.Repos) {
+		r := act.Repos[name]
+		head, _ := server.RepoHead(ctx, st.dataDir, name)
+		switch {
+		case r.State == server.StateConflict:
+			conflicts = append(conflicts, name)
+		case r.State == server.StateError:
+			errs = append(errs, name)
+		case r.State == server.StateOK && r.Head != "" && r.Head != head:
+			behind = append(behind, name)
+		case r.State == server.StateOK:
+			ok = append(ok, name)
 		}
-		if len(devices) == 0 {
-			fmt.Println("No devices registered. Add one with: dropgitbox device add NAME")
-			return nil
-		}
-		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(tw, "DEVICE\tADDED")
-		for _, d := range devices {
-			fmt.Fprintf(tw, "%s\t%s\n", d.Name, d.Created.Local().Format(time.DateTime))
-		}
-		return tw.Flush()
+	}
+	switch {
+	case len(conflicts) > 0:
+		return "CONFLICT in " + strings.Join(conflicts, ", ")
+	case len(errs) > 0:
+		return "ERROR in " + strings.Join(errs, ", ")
+	case len(behind) > 0:
+		return "behind in " + strings.Join(behind, ", ")
+	case len(ok) > 0:
+		return "in sync"
+	}
+	return "unknown"
+}
 
-	case "revoke", "remove", "rm":
-		if len(pos) != 1 {
-			return errors.New("usage: dropgitbox device revoke NAME")
-		}
-		if err := server.RevokeDevice(st.dataDir, pos[0]); err != nil {
-			return err
-		}
-		fmt.Printf("Revoked %q. Its token no longer works; the data already on that device stays there.\n", pos[0])
+func listDevices(ctx context.Context, st *serverSettings) error {
+	devices, err := server.ListDevices(st.dataDir)
+	if err != nil {
+		return err
+	}
+	if len(devices) == 0 {
+		fmt.Println("No devices registered. Add one with: dropgitbox device add NAME")
 		return nil
 	}
-	return fmt.Errorf("unknown device command %q\n\n%s", sub, help)
+	activity, err := server.ReadActivity(st.dataDir)
+	if err != nil {
+		return err
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "DEVICE\tLAST SEEN\tLAST PUSH\tSTATUS\tVERSION\tADDED")
+	for _, d := range devices {
+		act := activity[d.Name]
+		seen, push, ver := "never", "-", "-"
+		if act != nil {
+			seen = ago(act.LastSeen)
+			if act.ClientVersion != "" {
+				ver = act.ClientVersion
+			}
+			var last time.Time
+			for _, r := range act.Repos {
+				if r.LastPush.After(last) {
+					last = r.LastPush
+				}
+			}
+			if !last.IsZero() {
+				push = ago(last)
+			}
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", d.Name, seen, push, deviceStatus(ctx, st, act), ver,
+			d.Created.Local().Format(time.DateOnly))
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	fmt.Println("\nDetails: dropgitbox device show NAME   (activity is saved every few seconds)")
+	return nil
+}
+
+func showDevice(ctx context.Context, st *serverSettings, name string) error {
+	devices, err := server.ListDevices(st.dataDir)
+	if err != nil {
+		return err
+	}
+	var dev *server.Device
+	for i := range devices {
+		if devices[i].Name == name {
+			dev = &devices[i]
+		}
+	}
+	if dev == nil {
+		return fmt.Errorf("%w: %s", server.ErrNoSuchDevice, name)
+	}
+	activity, err := server.ReadActivity(st.dataDir)
+	if err != nil {
+		return err
+	}
+	act := activity[name]
+
+	fmt.Printf("Device:     %s\n", dev.Name)
+	fmt.Printf("Added:      %s\n", dev.Created.Local().Format(time.DateTime))
+	if !dev.Rotated.IsZero() {
+		fmt.Printf("Token rotated: %s\n", dev.Rotated.Local().Format(time.DateTime))
+	}
+	if act == nil {
+		fmt.Println("Last seen:  never")
+		return nil
+	}
+	fmt.Printf("Last seen:  %s (%s) from %s\n", ago(act.LastSeen), act.LastSeen.Local().Format(time.DateTime), orDash(act.LastIP))
+	fmt.Printf("Version:    %s\n", orDash(act.ClientVersion))
+	fmt.Printf("Status:     %s\n", deviceStatus(ctx, st, act))
+	if len(act.Repos) == 0 {
+		return nil
+	}
+	fmt.Println()
+	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "FOLDER\tSTATE\tREPORTED\tLAST FETCH\tLAST PUSH\tDEVICE HEAD\tSERVER HEAD")
+	for _, rn := range sortedKeys(act.Repos) {
+		r := act.Repos[rn]
+		head, _ := server.RepoHead(ctx, st.dataDir, rn)
+		state := orDash(r.State)
+		if r.State == server.StateOK && r.Head != "" {
+			if r.Head == head {
+				state = "ok, in sync"
+			} else {
+				state = "ok, behind"
+			}
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", rn, state, agoOrDash(r.StateAt), agoOrDash(r.LastFetch),
+			agoOrDash(r.LastPush), short(r.Head), short(head))
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	for _, rn := range sortedKeys(act.Repos) {
+		r := act.Repos[rn]
+		if r.State == server.StateConflict {
+			fmt.Printf("\n%s: paused on a conflict in: %s\n", rn, strings.Join(r.Conflicts, ", "))
+		}
+		if r.State == server.StateError && r.Message != "" {
+			fmt.Printf("\n%s: last sync failed: %s\n", rn, r.Message)
+		}
+	}
+	return nil
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func ago(t time.Time) string {
+	if t.IsZero() {
+		return "never"
+	}
+	d := time.Since(t)
+	switch {
+	case d < 10*time.Second:
+		return "just now"
+	case d < time.Minute:
+		return fmt.Sprintf("%ds ago", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 48*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	case d < 60*24*time.Hour:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	}
+	return t.Local().Format(time.DateOnly)
+}
+
+func agoOrDash(t time.Time) string {
+	if t.IsZero() {
+		return "-"
+	}
+	return ago(t)
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+func short(sha string) string {
+	if sha == "" {
+		return "-"
+	}
+	if len(sha) > 10 {
+		return sha[:10]
+	}
+	return sha
 }
 
 func configHint(cfg *config.Config) string {
