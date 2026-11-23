@@ -177,15 +177,15 @@ func cmdDevice(ctx context.Context, args []string) error {
   dropgitbox device revoke NAME           revoke a device's access immediately
 
 Run these on the server node, as the server's user or with sudo.`
-	if len(args) == 0 {
-		return errors.New(help)
-	}
-	sub, args := args[0], args[1:]
-
-	fs, cfgPath := newFlags("device " + sub)
+	// Flags may come before or after the subcommand.
+	fs, cfgPath := newFlags("device")
 	data := fs.String("data", "", "server data directory (config: server.data_dir)")
 	pubURL := fs.String("url", "", "URL devices use to reach the server (config: server.public_url)")
 	pos := parse(fs, args)
+	if len(pos) == 0 {
+		return errors.New(help)
+	}
+	sub, pos := pos[0], pos[1:]
 
 	st, err := loadServerSettings(*cfgPath, *data)
 	if err != nil {

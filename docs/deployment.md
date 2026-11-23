@@ -293,7 +293,12 @@ that have gone quiet.
   `journalctl --user -u dropgitbox` on Linux, `~/Library/Logs/dropgitbox.log`
   on macOS.
 - **Conflicts.** The client daemon pauses that folder and sends a desktop
-  notification. Run `dropgitbox status`, then `dropgitbox resolve`.
+  notification, and the hook if you configured one. Run `dropgitbox status`,
+  then `dropgitbox resolve`. The server also shows the conflict in
+  `dropgitbox device list`.
+- **Watching devices.** On each device, `dropgitbox status -short` fits a
+  status bar, and `dropgitbox events` streams what the daemon does. See
+  "Notifications and status" in the README.
 - **Headless clients.** On a machine nobody logs into, run
   `sudo loginctl enable-linger $USER` so the user service keeps running.
 - **Upgrades.** Install the new package, or re-run `install.sh`, then

@@ -18,8 +18,10 @@ var errStreamUnauthorized = errors.New("server rejected this device's token")
 
 // subscribe listens to the server's push notifications for the folder and
 // calls onHead with the server's branch head on connect and after every
-// push. It reconnects with backoff until ctx is cancelled.
-func subscribe(ctx context.Context, cfg Config, idleTimeout time.Duration, log *slog.Logger, onHead func(string)) {
+// push. It reconnects with backoff until ctx is cancelled. onRejected is
+// called when the server rejects the token (e.g. the device was revoked),
+// so the daemon can surface that promptly instead of at its next sync.
+func subscribe(ctx context.Context, cfg Config, idleTimeout time.Duration, log *slog.Logger, onHead func(string), onRejected func()) {
 	backoff := time.Second
 	for {
 		connected, err := streamEvents(ctx, cfg, idleTimeout, onHead)
@@ -33,6 +35,7 @@ func subscribe(ctx context.Context, cfg Config, idleTimeout time.Duration, log *
 			// A revoked or wrong token won't start working by retrying
 			// quickly; don't count towards the server's lockout.
 			backoff = 5 * time.Minute
+			onRejected()
 		}
 		log.Warn("event stream disconnected; retrying", "err", err, "in", backoff)
 		select {

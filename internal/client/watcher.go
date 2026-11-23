@@ -16,8 +16,9 @@ import (
 // watchTree calls trigger once the tree under root has been quiet for
 // debounce after a change, or at most maxDelay after the first change of a
 // burst, so continuous writes still get committed periodically.
-// Changes inside .git are ignored.
-func watchTree(ctx context.Context, root string, debounce, maxDelay time.Duration, log *slog.Logger, trigger func()) error {
+// Changes inside .git are ignored. onBurst, if set, is called when the
+// first change of a burst is seen.
+func watchTree(ctx context.Context, root string, debounce, maxDelay time.Duration, log *slog.Logger, trigger, onBurst func()) error {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
@@ -85,6 +86,9 @@ func watchTree(ctx context.Context, root string, debounce, maxDelay time.Duratio
 			now := time.Now()
 			if !inBurst {
 				inBurst, burstAt = true, now
+				if onBurst != nil {
+					onBurst()
+				}
 			}
 			wait := debounce
 			if deadline := burstAt.Add(maxDelay); now.Add(wait).After(deadline) {

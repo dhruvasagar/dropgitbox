@@ -354,7 +354,7 @@ func TestWatchDaemonSyncsLive(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	opts := client.DaemonOptions{Debounce: 100 * time.Millisecond, MaxDelay: time.Second, Poll: time.Hour, Notify: func([]string) {}}
+	opts := client.DaemonOptions{Debounce: 100 * time.Millisecond, MaxDelay: time.Second, Poll: time.Hour}
 	done := make(chan struct{}, 2)
 	for _, s := range []*client.Syncer{a, b} {
 		go func() {

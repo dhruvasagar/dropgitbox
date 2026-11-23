@@ -84,6 +84,10 @@ accepts:
 
 ## Quick start
 
+To try everything on one machine first (a server, two devices, a
+conflict, notifications, revoking a device), follow the
+[local demo](docs/demo.md).
+
 ### 1. Set up the server node
 
 ```sh
@@ -159,8 +163,10 @@ device's open connections.
 | `repos` | List folders on the server, and where each one is synced locally |
 | `setup -repo NAME -dir DIR` | Start syncing a folder, and register it in the config |
 | `watch` | Run the sync daemon for all configured folders, or `-dir DIR` |
-| `sync` | Commit and sync once |
-| `status` | Show head, ahead/behind, uncommitted changes and any conflict |
+| `sync` | Sync now. With the daemon running, it asks the daemon and waits for the result |
+| `status [-short\|-json]` | Live daemon state per folder, plus head, ahead/behind, uncommitted changes and any conflict |
+| `events [-json]` | Stream the daemon's events live |
+| `notify test` | Send a test desktop notification and run the hook command |
 | `resolve [-ours\|-theirs] [-force] [PATH...]` | Finish a paused merge, then sync |
 | `log [-n N] [PATH...]` | Show history, optionally for specific files |
 | `restore -rev REV PATH...` | Bring back an old version. It is committed as a *new* change, so nothing is lost |
@@ -189,6 +195,101 @@ Synced.
 Or keep one side without editing: `resolve -ours` keeps this device's
 version and `-theirs` keeps the server's, either for every conflicted file
 or only for the paths you list. Both versions stay in history either way.
+
+## Notifications and status
+
+The daemon (`dropgitbox watch`) turns everything that happens to a folder
+into events, and makes them visible in three ways.
+
+**Events**
+
+| Event | When | Desktop notification by default |
+| --- | --- | --- |
+| `pending` | Local changes detected, waiting for the folder to go quiet | |
+| `syncing` | A sync started | |
+| `synced` | A sync finished (with counts of committed and pulled files) | |
+| `remote_changes` | A sync brought in changes from other devices | |
+| `conflict` | Syncing paused on a conflict, and you need to act | ✔ |
+| `resolved` | The conflict was resolved and syncing resumed | ✔ |
+| `error` | A sync attempt failed; it is retried automatically | |
+| `offline` | Syncing has kept failing for `offline_after` (default 10 minutes), so brief network blips stay quiet | ✔ |
+| `online` | Syncing works again after `offline` or `unauthorized` | ✔ |
+| `unauthorized` | The server rejected this device's token (revoked or rotated) | ✔ |
+
+**1. Desktop notifications** on Linux use `notify-send`, falling back to
+`gdbus` (libnotify or GLib, present on most desktops). On macOS they use
+`osascript`, the built-in Notification Center. By default only events that
+need your attention, or tell you a problem is over, pop up. Routine syncing
+stays quiet, and is visible in `status` instead. Run `dropgitbox notify
+test` to check that notifications work.
+
+**2. Live status** comes from the daemon over a private Unix socket:
+`$XDG_RUNTIME_DIR/dropgitbox/daemon.sock`, or
+`~/.local/state/dropgitbox/daemon.sock`; the socket is mode 0600 and its
+directory 0700.
+
+```console
+$ dropgitbox status -short
+dropgitbox: CONFLICT Box
+$ dropgitbox status
+Daemon:  running (pid 4242, version 0.1.0, up 3h2m)
+
+Folder:  /home/me/Box
+State:   PAUSED: conflict in notes.txt
+...
+$ dropgitbox events
+13:43:31  syncing        Box: syncing
+13:43:31  conflict       Box: sync paused, conflict: Conflicting changes in notes.txt. ...
+13:43:35  resolved       Box: conflict resolved: Syncing has resumed.
+```
+
+`status -short` prints one line, the most urgent state across folders:
+`synced`, `pending`, `syncing`, `retrying`, `offline`, `CONFLICT` or
+`access denied`. Use it in status bars and prompts:
+
+```sh
+# tmux
+set -g status-right '#(dropgitbox status -short)'
+# waybar / polybar / i3blocks: a custom module running `dropgitbox status -short` every few seconds
+# macOS menu bar: a SwiftBar or xbar plugin that prints `dropgitbox status -short`
+```
+
+`status -json` and `events -json` give machine-readable state and events
+for richer integrations. While the daemon runs, `dropgitbox sync` asks it
+to sync and waits for the outcome, instead of running git in the same
+folder concurrently. Only one daemon runs per user, and starting a second
+is refused.
+
+**3. Hook command** runs your own program for chosen events, to forward
+notifications anywhere: ntfy, Pushover, email, a chat webhook, a sound.
+
+```toml
+[notify]
+command = ["~/bin/dropgitbox-hook"]
+command_events = ["conflict", "resolved", "offline", "online", "unauthorized", "remote_changes"]
+```
+
+The command runs directly, not through a shell. Each event arrives as
+JSON on stdin, and in environment variables:
+
+| Variable | Contents |
+| --- | --- |
+| `DROPGITBOX_EVENT` | Event type, e.g. `conflict` |
+| `DROPGITBOX_FOLDER`, `DROPGITBOX_REPO` | Which folder |
+| `DROPGITBOX_TITLE`, `DROPGITBOX_BODY` | Ready-made notification text |
+| `DROPGITBOX_URGENT` | `true` for events that need action |
+| `DROPGITBOX_FILES` | Conflicted or changed files, one per line |
+| `DROPGITBOX_MESSAGE` | Error or detail message |
+| `DROPGITBOX_TIME` | RFC 3339 timestamp |
+
+```sh
+#!/bin/sh
+# ~/bin/dropgitbox-hook: forward to a phone through ntfy
+curl -s -H "Title: $DROPGITBOX_TITLE" -d "$DROPGITBOX_BODY" https://ntfy.sh/my-private-topic >/dev/null
+```
+
+Hooks run one at a time, each with a 30 second limit, and failures are
+logged. Run `dropgitbox notify test` to try yours with a test event.
 
 ## Configuration
 
@@ -221,6 +322,11 @@ poll = "5m"
 [[folders]]                       # added by `dropgitbox setup`
 path = "~/Box"
 repo = "Box"
+
+[notify]                          # client daemon notifications
+desktop = true
+offline_after = "10m"
+command = ["~/bin/dropgitbox-hook"]
 ```
 
 The client token lives in a separate file, `~/.config/dropgitbox/token`

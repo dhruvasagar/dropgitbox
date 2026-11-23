@@ -63,6 +63,28 @@
 # poll = "5m"         # safety-net sync interval
 
 # ---------------------------------------------------------------------------
+# Notifications from the client daemon (`dropgitbox watch`).
+# Events: pending, syncing, synced, remote_changes, conflict, resolved,
+#         error, offline, online, unauthorized   ("*" = all)
+# Test with: dropgitbox notify test
+# ---------------------------------------------------------------------------
+[notify]
+# Native desktop notifications (notify-send/gdbus on Linux, Notification
+# Center on macOS).
+# desktop = true
+# desktop_events = ["conflict", "resolved", "offline", "online", "unauthorized"]
+
+# How long syncing must keep failing before "offline" is reported.
+# offline_after = "10m"
+
+# Run a command for events. It is executed directly (no shell). The event
+# is passed as JSON on stdin and as DROPGITBOX_* environment variables
+# (EVENT, FOLDER, REPO, TITLE, BODY, URGENT, FILES, MESSAGE, TIME).
+# command = ["~/bin/dropgitbox-hook"]
+# command_events = ["conflict", "resolved", "offline", "online", "unauthorized",
+#                   "remote_changes", "synced", "error"]
+
+# ---------------------------------------------------------------------------
 # Synced folders. `dropgitbox setup` adds entries; `dropgitbox watch` syncs
 # all of them and sets up any that do not exist on this device yet. Copy
 # this list to a new device and they all appear there.

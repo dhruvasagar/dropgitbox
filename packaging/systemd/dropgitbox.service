@@ -10,6 +10,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Desktop notifications go over the session D-Bus, which systemd user
+# services can reach. The control socket lives in $XDG_RUNTIME_DIR.
 ExecStart=/usr/bin/dropgitbox watch
 Restart=on-failure
 RestartSec=30

@@ -2,19 +2,21 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"text/tabwriter"
 	"time"
 
 	"github.com/dhruvasagar/dropgitbox/internal/client"
 	"github.com/dhruvasagar/dropgitbox/internal/config"
+	"github.com/dhruvasagar/dropgitbox/internal/daemon"
 	"github.com/dhruvasagar/dropgitbox/internal/server"
 )
 
@@ -290,6 +292,7 @@ func cmdWatch(ctx context.Context, args []string) error {
 	debounce := fs.Duration("debounce", 2*time.Second, "quiet period before committing (config: client.debounce)")
 	maxDelay := fs.Duration("max-delay", 30*time.Second, "longest a burst of changes may postpone a commit (config: client.max_delay)")
 	poll := fs.Duration("poll", 5*time.Minute, "safety-net sync interval (config: client.poll)")
+	noDesktop := fs.Bool("no-desktop-notify", false, "disable desktop notifications (config: notify.desktop)")
 	verbose := fs.Bool("v", false, "verbose logging")
 	parse(fs, args)
 
@@ -297,50 +300,71 @@ func cmdWatch(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	opts := client.DaemonOptions{Debounce: e.cfg.Client.Debounce, MaxDelay: e.cfg.Client.MaxDelay, Poll: e.cfg.Client.Poll}
-	if isSet(fs, "debounce") || opts.Debounce == 0 {
-		opts.Debounce = *debounce
+	cc := e.cfg.Client
+	syncOpts := client.DaemonOptions{Debounce: cc.Debounce, MaxDelay: cc.MaxDelay, Poll: cc.Poll,
+		OfflineAfter: e.cfg.Notify.OfflineAfter}
+	if isSet(fs, "debounce") || syncOpts.Debounce == 0 {
+		syncOpts.Debounce = *debounce
 	}
-	if isSet(fs, "max-delay") || opts.MaxDelay == 0 {
-		opts.MaxDelay = *maxDelay
+	if isSet(fs, "max-delay") || syncOpts.MaxDelay == 0 {
+		syncOpts.MaxDelay = *maxDelay
 	}
-	if isSet(fs, "poll") || opts.Poll == 0 {
-		opts.Poll = *poll
+	if isSet(fs, "poll") || syncOpts.Poll == 0 {
+		syncOpts.Poll = *poll
+	}
+	notify, err := notifyOptions(e.cfg)
+	if err != nil {
+		return err
+	}
+	if *noDesktop {
+		notify.Desktop = false
+	}
+
+	// Refuse early if a daemon is already running (before touching folders).
+	if c, err := daemon.Dial(""); err == nil {
+		if st, err := c.Status(ctx); err == nil {
+			return fmt.Errorf("%w (pid %d); stop it first, or use `dropgitbox status`", daemon.ErrAlreadyRunning, st.PID)
+		}
 	}
 
 	folders, err := e.folders(ctx, fs, *dir, true)
 	if err != nil {
 		return err
 	}
-	e.log.Info("dropgitbox daemon starting", "folders", len(folders), "version", version)
+	return daemon.Run(ctx, folders, daemon.Options{Sync: syncOpts, Notify: notify, Version: version, Logger: e.log})
+}
 
-	var (
-		wg     sync.WaitGroup
-		mu     sync.Mutex
-		failed int
-	)
-	for _, s := range folders {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := s.Watch(ctx, opts); err != nil {
-				e.log.Error("folder stopped", "folder", s.Dir(), "err", err)
-				mu.Lock()
-				failed++
-				mu.Unlock()
-			}
-		}()
+func notifyOptions(cfg *config.Config) (daemon.NotifyOptions, error) {
+	n := cfg.Notify
+	o := daemon.NotifyOptions{
+		Desktop:       n.Desktop == nil || *n.Desktop,
+		DesktopEvents: daemon.DefaultDesktopEvents,
+		CommandEvents: daemon.DefaultCommandEvents,
 	}
-	wg.Wait()
-	if failed > 0 && ctx.Err() == nil {
-		return fmt.Errorf("%d folder(s) stopped with errors", failed)
+	var err error
+	if len(n.DesktopEvents) > 0 {
+		if o.DesktopEvents, err = daemon.ParseEvents(n.DesktopEvents); err != nil {
+			return o, fmt.Errorf("notify.desktop_events: %w", err)
+		}
 	}
-	return nil
+	if len(n.CommandEvents) > 0 {
+		if o.CommandEvents, err = daemon.ParseEvents(n.CommandEvents); err != nil {
+			return o, fmt.Errorf("notify.command_events: %w", err)
+		}
+	}
+	if len(n.Command) > 0 {
+		o.Command = append([]string{cfg.Resolve(n.Command[0])}, n.Command[1:]...)
+		if _, err := exec.LookPath(o.Command[0]); err != nil {
+			return o, fmt.Errorf("notify.command: %w", err)
+		}
+	}
+	return o, nil
 }
 
 func cmdSync(ctx context.Context, args []string) error {
 	fs, cfgPath := newFlags("sync")
 	dir := fs.String("dir", ".", "synced folder (default: current or all configured folders)")
+	direct := fs.Bool("direct", false, "sync in this process even if the daemon is running")
 	parse(fs, args)
 
 	e, err := loadClient(*cfgPath, false)
@@ -351,6 +375,51 @@ func cmdSync(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+
+	// With a daemon running, ask it to sync rather than running git in the
+	// same folders concurrently.
+	if c, err := daemon.Dial(""); err == nil && !*direct {
+		if st, err := c.Status(ctx); err == nil {
+			managed := map[string]bool{}
+			for _, f := range st.Folders {
+				managed[f.Folder] = true
+			}
+			var failed []string
+			for _, s := range folders {
+				if !managed[s.Dir()] {
+					continue
+				}
+				out, err := c.Sync(ctx, s.Dir())
+				if err != nil {
+					return err
+				}
+				for _, o := range out {
+					fmt.Printf("%s: %s", o.Folder, o.Result)
+					if o.Message != "" {
+						fmt.Printf(" (%s)", o.Message)
+					}
+					fmt.Println()
+					if o.Result != "synced" {
+						failed = append(failed, o.Folder)
+					}
+				}
+			}
+			var unmanaged []*client.Syncer
+			for _, s := range folders {
+				if !managed[s.Dir()] {
+					unmanaged = append(unmanaged, s)
+				}
+			}
+			folders = unmanaged
+			if len(folders) == 0 {
+				if len(failed) > 0 {
+					return fmt.Errorf("sync did not complete for %s (see `dropgitbox status`)", strings.Join(failed, ", "))
+				}
+				return nil
+			}
+		}
+	}
+
 	var failed []string
 	for _, s := range folders {
 		if err := s.Sync(ctx); err != nil {
@@ -372,7 +441,26 @@ func cmdSync(ctx context.Context, args []string) error {
 func cmdStatus(ctx context.Context, args []string) error {
 	fs, cfgPath := newFlags("status")
 	dir := fs.String("dir", ".", "synced folder (default: current or all configured folders)")
+	short := fs.Bool("short", false, "one line summarising the daemon's state (for status bars and prompts)")
+	asJSON := fs.Bool("json", false, "print the daemon's live state as JSON")
 	parse(fs, args)
+
+	var live *daemon.Status
+	if c, err := daemon.Dial(""); err == nil {
+		live, _ = c.Status(ctx)
+	}
+	if *short {
+		fmt.Println(shortStatus(live))
+		return nil
+	}
+	if *asJSON {
+		if live == nil {
+			return errors.New("the dropgitbox daemon is not running")
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(live)
+	}
 
 	e, err := loadClient(*cfgPath, false)
 	if err != nil {
@@ -382,15 +470,26 @@ func cmdStatus(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	for i, s := range folders {
-		if i > 0 {
-			fmt.Println()
-		}
+	if live == nil {
+		fmt.Println("Daemon:  not running (start it with `dropgitbox watch` or the dropgitbox service)")
+	} else {
+		fmt.Printf("Daemon:  running (pid %d, version %s, up %s)\n", live.PID, live.Version,
+			time.Since(live.Started).Round(time.Second))
+	}
+	for _, s := range folders {
+		fmt.Println()
 		st, err := s.Status(ctx)
 		if err != nil {
 			return err
 		}
 		fmt.Printf("Folder:  %s\nServer:  %s\nRepo:    %s\nDevice:  %s\n", st.Config.Dir, st.Config.Server, st.Config.Repo, st.Config.Device)
+		if live != nil {
+			for _, f := range live.Folders {
+				if f.Folder == s.Dir() {
+					fmt.Printf("State:   %s\n", describeState(f))
+				}
+			}
+		}
 		fmt.Printf("Head:    %s\n", orNone(st.Head))
 		fmt.Printf("Server head (last fetched): %s\n", orNone(st.Remote))
 		fmt.Printf("Ahead %d / behind %d, %d uncommitted change(s)\n", st.Ahead, st.Behind, len(st.Uncommitted))
@@ -398,6 +497,133 @@ func cmdStatus(ctx context.Context, args []string) error {
 			fmt.Println()
 			printConflictHelp(ctx, s)
 		}
+	}
+	return nil
+}
+
+func describeState(f daemon.FolderStatus) string {
+	last := "never"
+	if !f.LastSync.IsZero() {
+		last = time.Since(f.LastSync).Round(time.Second).String() + " ago"
+	}
+	switch f.State {
+	case daemon.StateIdle:
+		return "in sync (last synced " + last + ")"
+	case daemon.StatePending:
+		return "changes pending"
+	case daemon.StateSyncing:
+		return "syncing..."
+	case daemon.StateConflict:
+		return "PAUSED: conflict in " + strings.Join(f.Conflicts, ", ")
+	case daemon.StateError:
+		return "retrying after error: " + f.LastError
+	case daemon.StateOffline:
+		return "OFFLINE since " + f.Since.Local().Format(time.DateTime) + ": " + f.LastError
+	case daemon.StateUnauthorized:
+		return "ACCESS DENIED: " + f.LastError
+	}
+	return f.State
+}
+
+// shortStatus summarises all folders in one line, most urgent first.
+func shortStatus(st *daemon.Status) string {
+	if st == nil {
+		return "dropgitbox: not running"
+	}
+	rank := map[string]int{daemon.StateUnauthorized: 6, daemon.StateConflict: 5, daemon.StateOffline: 4,
+		daemon.StateError: 3, daemon.StateSyncing: 2, daemon.StatePending: 1, daemon.StateIdle: 0}
+	worst, names := daemon.StateIdle, []string{}
+	for _, f := range st.Folders {
+		if rank[f.State] > rank[worst] {
+			worst, names = f.State, nil
+		}
+		if f.State == worst {
+			names = append(names, filepath.Base(f.Folder))
+		}
+	}
+	in := " " + strings.Join(names, ",")
+	switch worst {
+	case daemon.StateUnauthorized:
+		return "dropgitbox: access denied" + in
+	case daemon.StateConflict:
+		return "dropgitbox: CONFLICT" + in
+	case daemon.StateOffline:
+		return "dropgitbox: offline" + in
+	case daemon.StateError:
+		return "dropgitbox: retrying" + in
+	case daemon.StateSyncing:
+		return "dropgitbox: syncing" + in
+	case daemon.StatePending:
+		return "dropgitbox: pending" + in
+	}
+	return "dropgitbox: synced"
+}
+
+func cmdEvents(ctx context.Context, args []string) error {
+	fs, _ := newFlags("events")
+	asJSON := fs.Bool("json", false, "print events as JSON lines")
+	parse(fs, args)
+	c, err := daemon.Dial("")
+	if err != nil {
+		return errors.New("the dropgitbox daemon is not running")
+	}
+	if _, err := c.Status(ctx); err != nil {
+		return errors.New("the dropgitbox daemon is not running")
+	}
+	enc := json.NewEncoder(os.Stdout)
+	return c.Events(ctx, func(ev client.Event) {
+		if *asJSON {
+			_ = enc.Encode(ev)
+			return
+		}
+		title, body, _ := daemon.Describe(ev)
+		line := fmt.Sprintf("%s  %-14s %s", ev.Time.Local().Format(time.TimeOnly), ev.Type, title)
+		if body != "" {
+			line += ": " + strings.ReplaceAll(body, "\n", " ")
+		}
+		fmt.Println(line)
+	})
+}
+
+func cmdNotify(ctx context.Context, args []string) error {
+	if len(args) == 0 || args[0] != "test" {
+		return errors.New("usage: dropgitbox notify test   (sends a test desktop notification and runs the hook command)")
+	}
+	fs, cfgPath := newFlags("notify test")
+	parse(fs, args[1:])
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		return err
+	}
+	o, err := notifyOptions(cfg)
+	if err != nil {
+		return err
+	}
+	ok := true
+	if o.Desktop {
+		if err := daemon.SendTestNotification(); err != nil {
+			fmt.Println("desktop: FAILED:", err)
+			ok = false
+		} else {
+			fmt.Println("desktop: sent a test notification")
+		}
+	} else {
+		fmt.Println("desktop: disabled (notify.desktop = false)")
+	}
+	if len(o.Command) > 0 {
+		ev := client.Event{Time: time.Now(), Type: "test", Folder: "/path/to/folder", Repo: "test",
+			Message: "This is a test event from `dropgitbox notify test`."}
+		if err := daemon.RunHook(ctx, o.Command, ev, 30*time.Second); err != nil {
+			fmt.Println("command: FAILED:", err)
+			ok = false
+		} else {
+			fmt.Printf("command: ran %s successfully\n", o.Command[0])
+		}
+	} else {
+		fmt.Println("command: none configured (notify.command)")
+	}
+	if !ok {
+		return errors.New("some notification channels failed")
 	}
 	return nil
 }

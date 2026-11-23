@@ -81,14 +81,28 @@ func (s *Syncer) ConflictedFiles(ctx context.Context) ([]string, error) {
 	return gitx.Lines(out), nil
 }
 
+// Result describes what a sync did.
+type Result struct {
+	Committed []string // local paths committed before syncing
+	Pulled    []string // paths changed by merging in the server's changes
+	Pushed    bool     // local commits were pushed to the server
+	Head      string   // commit the folder is at afterwards
+}
+
 // Sync commits all local changes, merges in changes from the server and
 // pushes the result. It returns ErrConflict if the merge needs the user.
 // The outcome is reported to the server (best effort), so the server's
 // `dropgitbox device list` shows each device's sync state.
 func (s *Syncer) Sync(ctx context.Context) error {
-	err := s.sync(ctx)
-	s.report(ctx, err)
+	_, err := s.SyncWithResult(ctx)
 	return err
+}
+
+// SyncWithResult is Sync, also returning what changed.
+func (s *Syncer) SyncWithResult(ctx context.Context) (*Result, error) {
+	res, err := s.sync(ctx)
+	s.report(ctx, err)
+	return res, err
 }
 
 // report tells the server how the last sync went.
@@ -112,61 +126,97 @@ func (s *Syncer) report(ctx context.Context, syncErr error) {
 	}
 }
 
-func (s *Syncer) sync(ctx context.Context) error {
+func (s *Syncer) sync(ctx context.Context) (*Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	res := &Result{}
 	if s.Conflicted() {
-		return ErrConflict
+		return res, ErrConflict
 	}
-	if _, err := s.commitLocal(ctx); err != nil {
-		return err
+	_, committed, err := s.commitLocal(ctx)
+	if err != nil {
+		return res, err
 	}
+	res.Committed = committed
 
 	for range maxPushAttempts {
 		if _, err := s.git.Run(ctx, "fetch", "--quiet", "--prune", "origin"); err != nil {
-			return network(err)
+			return res, network(err)
 		}
 		remote, err := s.git.RevParse(ctx, "refs/remotes/origin/"+Branch)
 		if err != nil {
-			return err
+			return res, err
 		}
 		local, err := s.git.RevParse(ctx, "HEAD")
 		if err != nil {
-			return err
+			return res, err
 		}
 
 		if remote != "" && remote != local {
 			upToDate := false
 			if local != "" {
 				if upToDate, err = s.git.IsAncestor(ctx, remote, local); err != nil {
-					return err
+					return res, err
 				}
 			}
 			if !upToDate {
-				if err := s.merge(ctx); err != nil {
-					return err
+				before := local
+				err := s.merge(ctx)
+				if isOverwriteErr(err) {
+					// A file was saved between our commit and the merge:
+					// commit that too and merge again.
+					_, more, cerr := s.commitLocal(ctx)
+					if cerr != nil {
+						return res, cerr
+					}
+					res.Committed = append(res.Committed, more...)
+					if before, err = s.git.RevParse(ctx, "HEAD"); err != nil {
+						return res, err
+					}
+					err = s.merge(ctx)
+				}
+				if err != nil {
+					return res, err
 				}
 				if local, err = s.git.RevParse(ctx, "HEAD"); err != nil {
-					return err
+					return res, err
 				}
+				pulled, err := s.changedBetween(ctx, before, local)
+				if err != nil {
+					return res, err
+				}
+				res.Pulled = append(res.Pulled, pulled...)
 			}
 		}
+		res.Head = local
 
 		if local == "" || local == remote {
-			return nil // nothing to push
+			return res, nil // nothing to push
 		}
 		if _, err := s.git.Run(ctx, "push", "--quiet", "origin", "HEAD:refs/heads/"+Branch); err != nil {
 			if isPushRace(err) {
 				s.log.Debug("push raced with another device, retrying")
 				continue
 			}
-			return network(err)
+			return res, network(err)
 		}
 		s.log.Info("pushed", "head", short(local))
-		return nil
+		res.Pushed = true
+		return res, nil
 	}
-	return fmt.Errorf("gave up after %d attempts: the server keeps changing underneath us", maxPushAttempts)
+	return res, fmt.Errorf("gave up after %d attempts: the server keeps changing underneath us", maxPushAttempts)
+}
+
+// changedBetween lists paths that differ between two commits (from == ""
+// means the empty tree).
+func (s *Syncer) changedBetween(ctx context.Context, from, to string) ([]string, error) {
+	if from == "" {
+		out, err := s.git.Run(ctx, "ls-tree", "-r", "--name-only", to)
+		return gitx.Lines(out), err
+	}
+	out, err := s.git.Run(ctx, "diff", "--name-only", "--no-renames", from, to)
+	return gitx.Lines(out), err
 }
 
 // CommitLocal snapshots the working tree if anything changed, returning the
@@ -178,32 +228,37 @@ func (s *Syncer) CommitLocal(ctx context.Context) (string, error) {
 	if s.Conflicted() {
 		return "", ErrConflict
 	}
-	return s.commitLocal(ctx)
+	head, _, err := s.commitLocal(ctx)
+	return head, err
 }
 
-func (s *Syncer) commitLocal(ctx context.Context) (string, error) {
+func (s *Syncer) commitLocal(ctx context.Context) (string, []string, error) {
 	if _, err := s.git.Run(ctx, "add", "--all"); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	out, err := s.git.Run(ctx, "diff", "--cached", "--name-status", "--no-renames")
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	changes := gitx.Lines(out)
 	if len(changes) == 0 {
-		return "", nil
+		return "", nil, nil
 	}
 
 	subject, body := commitMessage(s.cfg.Device, changes, time.Now())
 	if _, err := s.git.Run(ctx, "commit", "--quiet", "--no-verify", "-m", subject, "-m", body); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	head, err := s.git.RevParse(ctx, "HEAD")
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	s.log.Info("committed", "commit", short(head), "files", len(changes))
-	return head, nil
+	paths := make([]string, len(changes))
+	for i, c := range changes {
+		_, paths[i], _ = strings.Cut(c, "\t")
+	}
+	return head, paths, nil
 }
 
 func (s *Syncer) merge(ctx context.Context) error {
@@ -221,6 +276,13 @@ func (s *Syncer) merge(ctx context.Context) error {
 		return ErrConflict
 	}
 	return err
+}
+
+// isOverwriteErr reports a merge refused because uncommitted changes
+// would be overwritten.
+func isOverwriteErr(err error) bool {
+	var ge *gitx.Error
+	return errors.As(err, &ge) && strings.Contains(ge.Stderr, "would be overwritten by merge")
 }
 
 func isPushRace(err error) bool {

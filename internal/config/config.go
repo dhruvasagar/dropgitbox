@@ -47,6 +47,7 @@ type Config struct {
 	Server  Server   `toml:"server"`
 	Client  Client   `toml:"client"`
 	Folders []Folder `toml:"folders"`
+	Notify  Notify   `toml:"notify"`
 
 	path     string   // file this was loaded from ("" when none was found)
 	explicit bool     // path came from -config / $DROPGITBOX_CONFIG
@@ -77,6 +78,20 @@ type Client struct {
 	Debounce  time.Duration `toml:"debounce"`   // e.g. "2s"
 	MaxDelay  time.Duration `toml:"max_delay"`  // e.g. "30s"
 	Poll      time.Duration `toml:"poll"`       // e.g. "5m"
+}
+
+// Notify configures the client daemon's notifications.
+type Notify struct {
+	// Desktop toggles native desktop notifications (default true).
+	Desktop *bool `toml:"desktop"`
+	// DesktopEvents overrides which events pop up (default: conflict,
+	// resolved, offline, online, unauthorized). "*" means all.
+	DesktopEvents []string `toml:"desktop_events"`
+	// Command is run for each of CommandEvents, e.g. ["~/bin/notify.sh"].
+	// It is executed directly, not through a shell.
+	Command       []string      `toml:"command"`
+	CommandEvents []string      `toml:"command_events"`
+	OfflineAfter  time.Duration `toml:"offline_after"` // default "10m"
 }
 
 // Folder is a synced folder the daemon manages.

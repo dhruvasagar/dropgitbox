@@ -37,7 +37,9 @@ Client device:
   dropgitbox setup -repo NAME -dir DIR   sync a folder (and register it in the config)
   dropgitbox watch                       run the sync daemon for all configured folders
   dropgitbox sync                        commit and sync once
-  dropgitbox status
+  dropgitbox status [-short | -json]      live daemon state + folder details
+  dropgitbox events [-json]              stream sync events from the daemon
+  dropgitbox notify test                 check desktop notifications and the hook
   dropgitbox resolve [-ours | -theirs] [-force] [PATH...]
   dropgitbox log [-n N] [PATH...]
   dropgitbox restore -rev REV PATH...
@@ -74,6 +76,8 @@ func main() {
 		"resolve": cmdResolve,
 		"log":     cmdLog,
 		"restore": cmdRestore,
+		"events":  cmdEvents,
+		"notify":  cmdNotify,
 		"config":  cmdConfig,
 		"version": cmdVersion,
 	}
