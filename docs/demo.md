@@ -45,15 +45,20 @@ Paste this into **every** terminal:
 
 ```sh
 export DEMO=~/dgb-demo
-alias dl='XDG_CONFIG_HOME=$DEMO/laptop/config  DROPGITBOX_SOCKET=$DEMO/laptop/d.sock  dropgitbox'
-alias dd='XDG_CONFIG_HOME=$DEMO/desktop/config DROPGITBOX_SOCKET=$DEMO/desktop/d.sock dropgitbox'
-alias ds='dropgitbox device -data $DEMO/server'
+alias dl='XDG_CONFIG_HOME=${DEMO:?run: export DEMO=~/dgb-demo}/laptop/config  DROPGITBOX_SOCKET=$DEMO/laptop/d.sock  dropgitbox'
+alias dd='XDG_CONFIG_HOME=${DEMO:?run: export DEMO=~/dgb-demo}/desktop/config DROPGITBOX_SOCKET=$DEMO/desktop/d.sock dropgitbox'
+alias ds='dropgitbox device -config ${DEMO:?run: export DEMO=~/dgb-demo}/server.toml'
 ```
+
+Each terminal needs `DEMO` set, not only the aliases. If it's missing, the
+aliases stop with `DEMO: run: export DEMO=~/dgb-demo` instead of pointing
+at the wrong directories.
 
 - `dl` runs dropgitbox as the laptop and `dd` as the desktop. Each alias
   points at its own config directory (which also holds the device's
   token) and its own daemon control socket.
-- `ds` manages devices on the demo server.
+- `ds` manages devices on the demo server, using the server's config file
+  from step 3.
 
 You only need these aliases because two devices share one user account
 here. Only one daemon may run per user, and both would otherwise read
@@ -62,15 +67,31 @@ here. Only one daemon may run per user, and both would otherwise read
 
 ## 3. Start the server
 
-In the **server** terminal:
+In the **server** terminal, write the server's config and start it:
 
 ```sh
-dropgitbox server -addr 127.0.0.1:8080 -data $DEMO/server
+mkdir -p ${DEMO:?}
+cat > $DEMO/server.toml <<'EOF'
+[server]
+addr       = "127.0.0.1:8080"
+data_dir   = "server"                  # relative to this file: $DEMO/server
+public_url = "http://127.0.0.1:8080"   # the URL that goes into invites
+EOF
+
+dropgitbox server -config $DEMO/server.toml
 ```
 
 It logs that it is listening, and warns that no devices are registered
 yet. Leave it running: this terminal now shows the server's log, including
 every rejected request.
+
+This is exactly how a real server is set up, just with a different file:
+`install.sh --server --public-url https://box.example.com` writes
+`/etc/dropgitbox/config.toml`. `public_url` is the address devices use to
+reach the server. You set it once, and every invite uses it. On a public
+server behind a reverse proxy, it is the proxy's `https://` address, not
+the `addr` dropgitbox listens on. If it is missing, the server warns at
+startup.
 
 The server stores a bare git repository per synced folder
 (`$DEMO/server/Box.git`), plus `devices.json` (device names and token
@@ -81,8 +102,8 @@ The server stores a bare git repository per synced folder
 In the **play** terminal:
 
 ```sh
-ds add laptop  -url http://127.0.0.1:8080
-ds add desktop -url http://127.0.0.1:8080
+ds add laptop
+ds add desktop
 ```
 
 Each command prints an invite line like this:
@@ -94,6 +115,13 @@ Each command prints an invite line like this:
 The invite holds the server URL, the device's name and its access token,
 and it is the only time the token is shown. The server keeps only a hash.
 On real devices you would send the invite over a private channel.
+
+Before printing the invite, `device add` checks that `public_url` answers
+like a dropgitbox server from this machine. If it doesn't, you get a
+warning, for example when the server isn't running or the port is wrong.
+The invite is still created, and `ds rotate NAME` makes a corrected one.
+For a one-off invite with a different address, e.g. a VPN name, pass
+`-url`.
 
 ## 5. Join, set up the folder, and start the daemons
 
@@ -340,7 +368,7 @@ The files already on the desktop stay put.
 Bring the desktop back with a new invite:
 
 ```sh
-ds add desktop -url http://127.0.0.1:8080
+ds add desktop
 ```
 
 Stop the desktop daemon. Then run the following, pasting the new invite
@@ -395,9 +423,11 @@ seconds. Run `dl sync` to fetch it at once.
 
 | Symptom | Cause and fix |
 | --- | --- |
+| `mkdir /server: permission denied`, or `/server.toml` not found | `DEMO` isn't set in that terminal. Run `export DEMO=~/dgb-demo` there. |
 | `a dropgitbox daemon is already running` | That device's daemon is still running in another terminal, or you used plain `dropgitbox` instead of `dl` or `dd`. |
 | `join`: `connection refused` | The server isn't running, or isn't on `127.0.0.1:8080`. |
 | `join`: `the server rejected the token` | The invite was mistyped, or that device was revoked or rotated after the invite was made. Make a new one with `ds add` or `ds rotate`. |
 | Changes don't appear on the other device | Is that device's daemon running? `dd status` shows it. `dd sync` forces a sync and prints the result. |
 | `notify test`: `no desktop notification mechanism found` | No desktop session, or `notify-send` isn't installed. See step 9. |
-| Port 8080 is taken | Use another port in steps 3, 4 and 10, e.g. `-addr 127.0.0.1:18080` with `-url http://127.0.0.1:18080`. |
+| Port 8080 is taken | Change the port in both `addr` and `public_url` in `$DEMO/server.toml`, e.g. `127.0.0.1:18080`, then restart the server. |
+| `device add` warns that the URL `did not answer` | The server isn't running, or `public_url` doesn't match `addr`. Fix `$DEMO/server.toml`, then `ds rotate NAME` for a corrected invite. |

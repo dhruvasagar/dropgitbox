@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/netip"
@@ -79,6 +80,12 @@ func cmdServer(ctx context.Context, args []string) error {
 		return err
 	} else if n == 0 && st.token == "" {
 		log.Warn("no devices registered yet; add one with `dropgitbox device add NAME`")
+	}
+	if st.url == "" {
+		log.Warn("server.public_url is not set: `dropgitbox device add` needs it to build invites (or pass -url each time)",
+			"config", configHint(st.cfg))
+	} else if err := client.ValidServerURL(st.url); err != nil {
+		log.Warn("server.public_url is invalid; invites will be rejected until it is fixed", "err", err)
 	}
 
 	hs := &http.Server{
@@ -204,6 +211,9 @@ Run these on the server node, as the server's user or with sudo.`
 		if st.url == "" {
 			return errors.New("the server's public URL is unknown; pass -url https://box.example.com or set server.public_url in " + configHint(st.cfg))
 		}
+		if err := client.ValidServerURL(st.url); err != nil {
+			return fmt.Errorf("invalid server URL (-url or server.public_url): %w", err)
+		}
 		return nil
 	}
 
@@ -222,6 +232,7 @@ Run these on the server node, as the server's user or with sudo.`
 		}
 		fmt.Printf("Registered device %q.\n\n", name)
 		printInvite(st.url, token, name)
+		checkReachable(ctx, st.url)
 		return nil
 
 	case "rotate":
@@ -239,6 +250,7 @@ Run these on the server node, as the server's user or with sudo.`
 		fmt.Printf("Issued a new token for %q; the old one no longer works.\n\n", name)
 		printInvite(st.url, token, name)
 		fmt.Println("(On that device run the join command with -force to replace the old token. Its folders stay as they are.)")
+		checkReachable(ctx, st.url)
 		return nil
 
 	case "list", "ls":
@@ -263,6 +275,36 @@ Run these on the server node, as the server's user or with sudo.`
 		return nil
 	}
 	return fmt.Errorf("unknown device command %q\n\n%s", sub, help)
+}
+
+// checkReachable warns, without failing, when the invite's URL does not
+// answer like a dropgitbox server from here. It catches a wrong host or
+// port before the invite is sent. It can't prove that other devices can
+// reach it, and a server that isn't up yet (DNS, proxy) is fine.
+func checkReachable(ctx context.Context, serverURL string) {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	u := strings.TrimRight(serverURL, "/") + "/healthz"
+	warn := func(format string, a ...any) {
+		fmt.Fprintf(os.Stderr, "\nWarning: "+format+"\n", a...)
+		fmt.Fprintln(os.Stderr, "The invite was still created. If the URL is wrong, fix server.public_url (or -url) and run `dropgitbox device rotate NAME`.")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		warn("cannot check %s: %v", serverURL, err)
+		return
+	}
+	req.Header.Set("User-Agent", "dropgitbox/"+version)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		warn("%s did not answer from this machine (%v).\nIs the server running, and is the URL right?", serverURL, err)
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
+	if resp.StatusCode != http.StatusOK || strings.TrimSpace(string(body)) != "ok" {
+		warn("%s answered %s, which doesn't look like a dropgitbox server.\nCheck the URL, and that your reverse proxy forwards it to dropgitbox.", serverURL, resp.Status)
+	}
 }
 
 func printInvite(serverURL, token, name string) {

@@ -59,8 +59,22 @@ func DecodeInvite(s string) (Invite, error) {
 	if inv.Token == "" {
 		return inv, errors.New("invite has no token")
 	}
-	if u, err := url.Parse(inv.Server); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return inv, fmt.Errorf("invite has an invalid server URL %q", inv.Server)
+	if err := ValidServerURL(inv.Server); err != nil {
+		return inv, fmt.Errorf("invite has an invalid server URL: %w (ask for a new invite)", err)
 	}
 	return inv, nil
+}
+
+// ValidServerURL checks that s is an absolute http(s) URL such as
+// https://box.example.com, and suggests a fix for the common mistake of
+// leaving out the scheme.
+func ValidServerURL(s string) error {
+	u, err := url.Parse(s)
+	if err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" {
+		return nil
+	}
+	if s != "" && !strings.Contains(s, "://") {
+		return fmt.Errorf("%q has no scheme; use https://%s (or http://%s for localhost or a private network)", s, s, s)
+	}
+	return fmt.Errorf("%q is not an http:// or https:// URL", s)
 }
