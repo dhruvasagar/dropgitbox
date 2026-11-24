@@ -86,6 +86,7 @@ type Daemon struct {
 
 // folderRun is one folder's sync loop.
 type folderRun struct {
+	syncer *client.Syncer
 	cancel context.CancelFunc
 	done   chan struct{} // closed when the loop has exited
 }
@@ -199,7 +200,7 @@ func (d *Daemon) startFolder(ctx context.Context, s *client.Syncer) {
 	kick := make(chan struct{}, 1)
 	d.kicks[dir] = kick
 	fctx, cancel := context.WithCancel(ctx)
-	r := &folderRun{cancel: cancel, done: make(chan struct{})}
+	r := &folderRun{syncer: s, cancel: cancel, done: make(chan struct{})}
 	d.running[dir] = r
 	d.wg.Add(1)
 	d.mu.Unlock()
@@ -411,6 +412,15 @@ func (d *Daemon) Status() Status {
 		st.Folders = append(st.Folders, f)
 	}
 	return st
+}
+
+// stillConflicted reports whether a folder's merge is still unfinished. Its
+// state lags a resolve by up to a couple of seconds, so look at git itself.
+func (d *Daemon) stillConflicted(folder string) bool {
+	d.mu.Lock()
+	r := d.running[folder]
+	d.mu.Unlock()
+	return r == nil || r.syncer.Conflicted()
 }
 
 // kick asks folders to sync now. An empty folder means all.

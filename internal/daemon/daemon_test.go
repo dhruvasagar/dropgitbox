@@ -232,6 +232,12 @@ func TestConflictPausesAndResumesWithEvents(t *testing.T) {
 	if _, err := b.Resolve(ctx, client.ResolveOptions{}); err != nil {
 		t.Fatal(err)
 	}
+	// What `dropgitbox resolve` does next: ask the daemon to sync. It must
+	// not answer from its paused state, which lags the resolve.
+	out, err = db.client(t).Sync(ctx, "")
+	if err != nil || len(out) != 1 || out[0].Result != "synced" {
+		t.Fatalf("sync right after resolve: %+v %v", out, err)
+	}
 	waitFor(t, 10*time.Second, func() bool {
 		st := db.state(t)
 		return st.State == daemon.StateIdle && len(st.Conflicts) == 0

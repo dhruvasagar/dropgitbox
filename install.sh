@@ -9,6 +9,10 @@
 #   --version VERSION   install a specific release (e.g. v0.1.0); default: latest
 #   --bin-dir DIR       where to put the binary
 #                       (default: /usr/local/bin as root, ~/.local/bin otherwise)
+#   --man-dir DIR       where to put the dropgitbox(1) man page
+#                       (default: share/man/man1 next to the binary's directory,
+#                       where man finds it: /usr/local/share/man/man1 or
+#                       ~/.local/share/man/man1)
 #   --service           install and start the per-user sync daemon
 #                       (systemd user unit on Linux, launchd agent on macOS)
 #   --server            set up this machine as a server node: system service,
@@ -23,6 +27,7 @@ set -eu
 REPO="dhruvasagar/dropgitbox"
 VERSION="latest"
 BIN_DIR=""
+MAN_DIR=""
 SERVICE=0
 SERVER=0
 PUBLIC_URL=""
@@ -35,10 +40,11 @@ while [ $# -gt 0 ]; do
 	case "$1" in
 	--version) VERSION="${2:?--version needs a value}"; shift 2 ;;
 	--bin-dir) BIN_DIR="${2:?--bin-dir needs a value}"; shift 2 ;;
+	--man-dir) MAN_DIR="${2:?--man-dir needs a value}"; shift 2 ;;
 	--service) SERVICE=1; shift ;;
 	--server) SERVER=1; shift ;;
 	--public-url) PUBLIC_URL="${2:?--public-url needs a value}"; shift 2 ;;
-	-h | --help) sed -n '2,22p' "$0" 2>/dev/null || true; exit 0 ;;
+	-h | --help) sed -n '2,/^set -eu/p' "$0" 2>/dev/null | sed '$d' || true; exit 0 ;;
 	*) err "unknown option: $1" ;;
 	esac
 done
@@ -72,6 +78,8 @@ fi
 if [ -z "$BIN_DIR" ]; then
 	if [ "$uid" = 0 ]; then BIN_DIR=/usr/local/bin; else BIN_DIR="$HOME/.local/bin"; fi
 fi
+# man looks in ../share/man next to each directory on PATH.
+[ -n "$MAN_DIR" ] || MAN_DIR="$(dirname "$BIN_DIR")/share/man/man1"
 
 # ---- resolve version --------------------------------------------------------
 if [ "$VERSION" = latest ] && [ -z "${DROPGITBOX_DOWNLOAD_BASE:-}" ]; then
@@ -110,6 +118,11 @@ tar -xzf "$tmp/$archive" -C "$tmp/x"
 mkdir -p "$BIN_DIR"
 install -m 0755 "$tmp/x/dropgitbox" "$BIN_DIR/dropgitbox"
 say "Installed $("$BIN_DIR/dropgitbox" version) to $BIN_DIR/dropgitbox"
+if [ -f "$tmp/x/man/dropgitbox.1" ]; then
+	mkdir -p "$MAN_DIR"
+	install -m 0644 "$tmp/x/man/dropgitbox.1" "$MAN_DIR/dropgitbox.1"
+	say "Installed the man page to $MAN_DIR/dropgitbox.1 (man dropgitbox)"
+fi
 
 case ":$PATH:" in
 *":$BIN_DIR:"*) ;;
@@ -171,6 +184,6 @@ if [ "$SERVICE" = 0 ] && [ "$SERVER" = 0 ]; then
 	say ""
 	say "Next steps:"
 	say "  server node:   sudo sh install.sh --server   (or see the README)"
-	say "  client device: dropgitbox join <invite>; dropgitbox setup -repo NAME -dir ~/NAME"
+	say "  client device: dropgitbox join <invite>; dropgitbox setup --repo NAME --dir ~/NAME"
 	say "                 then re-run with --service, or run: dropgitbox watch"
 fi

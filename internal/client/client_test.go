@@ -198,9 +198,9 @@ func TestConflictPausesSyncUntilResolved(t *testing.T) {
 	}
 
 	// Refuses to conclude while markers remain.
-	var me *client.MarkersError
-	if _, err := b.Resolve(ctx, client.ResolveOptions{}); !errors.As(err, &me) {
-		t.Fatalf("want MarkersError, got %v", err)
+	var ue *client.UnresolvedError
+	if _, err := b.Resolve(ctx, client.ResolveOptions{}); !errors.As(err, &ue) || len(ue.Markers) != 1 {
+		t.Fatalf("want UnresolvedError with markers, got %v", err)
 	}
 
 	write(t, b, "doc.txt", "from a and b\n")
@@ -223,6 +223,156 @@ func TestConflictPausesSyncUntilResolved(t *testing.T) {
 		if !strings.Contains(git(t, a, "log", "-p", "--all", "--", "doc.txt"), v) {
 			t.Fatalf("history lost %q", v)
 		}
+	}
+}
+
+// conflictOn makes a and b change the same files differently; b's sync
+// then pauses on a conflict. contents maps file -> [original, a's, b's].
+func conflictOn(t *testing.T, contents map[string][3]string) (a, b *client.Syncer) {
+	t.Helper()
+	ts := startServer(t)
+	a, b = setup(t, ts, "a"), setup(t, ts, "b")
+	for f, c := range contents {
+		write(t, a, f, c[0])
+	}
+	mustSync(t, a)
+	mustSync(t, b)
+	for f, c := range contents {
+		write(t, a, f, c[1])
+		write(t, b, f, c[2])
+	}
+	mustSync(t, a)
+	if err := b.Sync(context.Background()); !errors.Is(err, client.ErrConflict) {
+		t.Fatalf("want conflict, got %v", err)
+	}
+	return a, b
+}
+
+func TestResolveFileByFile(t *testing.T) {
+	a, b := conflictOn(t, map[string][3]string{
+		"one.txt": {"x\n", "a1\n", "b1\n"},
+		"two.txt": {"x\n", "a2\n", "b2\n"},
+	})
+	ctx := context.Background()
+
+	cs, err := b.Conflicts(ctx)
+	if err != nil || len(cs) != 2 || cs[0].Path != "one.txt" || cs[0].Kind != client.BothModified || cs[0].Binary {
+		t.Fatalf("conflicts = %+v, %v", cs, err)
+	}
+
+	write(t, b, "one.txt", "merged 1\n")
+	res, err := b.Resolve(ctx, client.ResolveOptions{Paths: []string{"one.txt"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Remaining) != 1 || res.Remaining[0].Path != "two.txt" || res.Commit != "" || !b.Conflicted() {
+		t.Fatalf("after one file: %+v, conflicted=%v", res, b.Conflicted())
+	}
+	// A file that isn't conflicted (any more) is an error, naming the rest.
+	var nc *client.NotConflictedError
+	if _, err := b.Resolve(ctx, client.ResolveOptions{Paths: []string{"one.txt"}}); !errors.As(err, &nc) ||
+		len(nc.Conflicted) != 1 {
+		t.Fatalf("want NotConflictedError, got %v", err)
+	}
+
+	res, err = b.Resolve(ctx, client.ResolveOptions{Paths: []string{"two.txt"}, Side: client.SideTheirs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Remaining) != 0 || res.Commit == "" || b.Conflicted() {
+		t.Fatalf("after both files: %+v, conflicted=%v", res, b.Conflicted())
+	}
+	if _, err := b.Resolve(ctx, client.ResolveOptions{}); !errors.Is(err, client.ErrNoConflict) {
+		t.Fatalf("want ErrNoConflict, got %v", err)
+	}
+	mustSync(t, b)
+	mustSync(t, a)
+	if read(t, a, "one.txt") != "merged 1\n" || read(t, a, "two.txt") != "a2\n" {
+		t.Fatalf("a has %q, %q", read(t, a, "one.txt"), read(t, a, "two.txt"))
+	}
+}
+
+func TestResolveBinaryNeedsAChoice(t *testing.T) {
+	_, b := conflictOn(t, map[string][3]string{
+		"photo.bin": {"\x00orig", "\x00from a", "\x00from b"},
+		"notes.txt": {"x\n", "a\n", "b\n"},
+	})
+	ctx := context.Background()
+	cs, err := b.Conflicts(ctx)
+	if err != nil || len(cs) != 2 || cs[1].Path != "photo.bin" || !cs[1].Binary || !cs[1].NeedsChoice() {
+		t.Fatalf("conflicts = %+v, %v", cs, err)
+	}
+
+	// Plain resolve won't silently keep this device's binary.
+	write(t, b, "notes.txt", "a and b\n")
+	var ue *client.UnresolvedError
+	if _, err := b.Resolve(ctx, client.ResolveOptions{}); !errors.As(err, &ue) ||
+		len(ue.NeedChoice) != 1 || ue.NeedChoice[0].Path != "photo.bin" || len(ue.Markers) != 0 {
+		t.Fatalf("want UnresolvedError for photo.bin, got %v", err)
+	}
+	if left, _ := b.ConflictedFiles(ctx); len(left) != 2 {
+		t.Fatalf("a refused resolve must change nothing, conflicted = %v", left)
+	}
+	// Naming it keeps it as it is, like git add.
+	res, err := b.Resolve(ctx, client.ResolveOptions{Paths: []string{"photo.bin", "notes.txt"}})
+	if err != nil || res.Commit == "" {
+		t.Fatalf("resolve named: %+v, %v", res, err)
+	}
+	if got := read(t, b, "photo.bin"); got != "\x00from b" {
+		t.Fatalf("photo.bin = %q", got)
+	}
+}
+
+func TestResolveModifyDeleteNeedsAChoice(t *testing.T) {
+	ts := startServer(t)
+	a, b := setup(t, ts, "a"), setup(t, ts, "b")
+	ctx := context.Background()
+	write(t, a, "doc.txt", "original\n")
+	mustSync(t, a)
+	mustSync(t, b)
+	if err := os.Remove(filepath.Join(a.Dir(), "doc.txt")); err != nil {
+		t.Fatal(err)
+	}
+	write(t, b, "doc.txt", "edited on b\n")
+	mustSync(t, a)
+	if err := b.Sync(ctx); !errors.Is(err, client.ErrConflict) {
+		t.Fatalf("want conflict, got %v", err)
+	}
+	cs, _ := b.Conflicts(ctx)
+	if len(cs) != 1 || cs[0].Kind != client.DeletedByThem {
+		t.Fatalf("conflicts = %+v", cs)
+	}
+	var ue *client.UnresolvedError
+	if _, err := b.Resolve(ctx, client.ResolveOptions{}); !errors.As(err, &ue) || len(ue.NeedChoice) != 1 {
+		t.Fatalf("want UnresolvedError, got %v", err)
+	}
+	if _, err := b.Resolve(ctx, client.ResolveOptions{Side: client.SideOurs}); err != nil {
+		t.Fatal(err)
+	}
+	mustSync(t, b)
+	mustSync(t, a)
+	if got := read(t, a, "doc.txt"); got != "edited on b\n" {
+		t.Fatalf("a doc.txt = %q", got)
+	}
+}
+
+func TestEditsWhilePausedAreNotInTheMerge(t *testing.T) {
+	_, b := conflictOn(t, map[string][3]string{"doc.txt": {"x\n", "a\n", "b\n"}})
+	ctx := context.Background()
+	write(t, b, "later.txt", "written while paused\n")
+	if _, err := b.Resolve(ctx, client.ResolveOptions{Side: client.SideOurs}); err != nil {
+		t.Fatal(err)
+	}
+	merged := git(t, b, "diff", "--name-only", "HEAD^1", "HEAD")
+	if strings.Contains(merged, "later.txt") {
+		t.Fatalf("the merge commit took in later.txt: %q", merged)
+	}
+	if st := git(t, b, "status", "--porcelain"); !strings.Contains(st, "later.txt") {
+		t.Fatalf("later.txt should still be uncommitted, status %q", st)
+	}
+	mustSync(t, b)
+	if msg := git(t, b, "log", "-1", "--format=%s", "--", "later.txt"); !strings.Contains(msg, "later.txt") {
+		t.Fatalf("later.txt should get its own commit, got %q", msg)
 	}
 }
 

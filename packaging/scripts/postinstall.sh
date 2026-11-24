@@ -10,7 +10,7 @@ dropgitbox installed.
                  (set public_url in /etc/dropgitbox/config.toml first)
                  sudo dropgitbox device add laptop
   Client device: dropgitbox join <invite>
-                 dropgitbox setup -repo NAME -dir ~/NAME
+                 dropgitbox setup --repo NAME --dir ~/NAME
                  systemctl --user enable --now dropgitbox
 
 Docs: https://github.com/dhruvasagar/dropgitbox

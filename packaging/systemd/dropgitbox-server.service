@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/dropgitbox server -config /etc/dropgitbox/config.toml
+ExecStart=/usr/bin/dropgitbox server --config /etc/dropgitbox/config.toml
 Restart=on-failure
 RestartSec=5
 

@@ -1,7 +1,7 @@
 # dropgitbox configuration reference.
 #
 # Location (first found wins):
-#   -config FILE or $DROPGITBOX_CONFIG
+#   --config FILE or $DROPGITBOX_CONFIG
 #   $XDG_CONFIG_HOME/dropgitbox/config.toml   (default ~/.config/dropgitbox/config.toml)
 #   $XDG_CONFIG_DIRS/dropgitbox/config.toml   (default /etc/xdg/dropgitbox/config.toml)
 #   /etc/dropgitbox/config.toml               (packaged server)

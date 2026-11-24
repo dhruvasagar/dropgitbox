@@ -47,7 +47,7 @@ Paste this into **every** terminal:
 export DEMO=~/dgb-demo
 alias dl='XDG_CONFIG_HOME=${DEMO:?run: export DEMO=~/dgb-demo}/laptop/config  DROPGITBOX_SOCKET=$DEMO/laptop/d.sock  dropgitbox'
 alias dd='XDG_CONFIG_HOME=${DEMO:?run: export DEMO=~/dgb-demo}/desktop/config DROPGITBOX_SOCKET=$DEMO/desktop/d.sock dropgitbox'
-alias ds='dropgitbox device -config ${DEMO:?run: export DEMO=~/dgb-demo}/server.toml'
+alias ds='dropgitbox device --config ${DEMO:?run: export DEMO=~/dgb-demo}/server.toml'
 ```
 
 Each terminal needs `DEMO` set, not only the aliases. If it's missing, the
@@ -78,7 +78,7 @@ data_dir   = "server"                  # relative to this file: $DEMO/server
 public_url = "http://127.0.0.1:8080"   # the URL that goes into invites
 EOF
 
-dropgitbox server -config $DEMO/server.toml
+dropgitbox server --config $DEMO/server.toml
 ```
 
 It logs that it is listening, and warns that no devices are registered
@@ -121,7 +121,7 @@ like a dropgitbox server from this machine. If it doesn't, you get a
 warning, for example when the server isn't running or the port is wrong.
 The invite is still created, and `ds rotate NAME` makes a corrected one.
 For a one-off invite with a different address, e.g. a VPN name, pass
-`-url`.
+`--url`.
 
 ## 5. Join, set up the folder, and start the daemons
 
@@ -130,7 +130,7 @@ In the **laptop** terminal, paste the laptop's invite after `dl join`:
 ```sh
 dl join dgb1.…laptop invite…
 mkdir -p $DEMO/laptop/Box && echo "first note" > $DEMO/laptop/Box/notes.txt
-dl setup -repo Box -dir $DEMO/laptop/Box
+dl setup --repo Box --dir $DEMO/laptop/Box
 dl watch
 ```
 
@@ -138,7 +138,7 @@ In the **desktop** terminal, with the desktop's invite:
 
 ```sh
 dd join dgb1.…desktop invite…
-dd setup -repo Box -dir $DEMO/desktop/Box
+dd setup --repo Box --dir $DEMO/desktop/Box
 dd watch
 ```
 
@@ -206,21 +206,21 @@ Everything below runs in the **play** terminal.
 
 ```sh
 dd status            # live daemon state + git details for each folder
-dd status -short     # one line, for a status bar: "dropgitbox: synced"
-dd status -json      # machine-readable daemon state
+dd status --short     # one line, for a status bar: "dropgitbox: synced"
+dd status --json      # machine-readable daemon state
 ```
 
 **History.** Every change is a commit, so nothing is ever lost:
 
 ```sh
-dl log -dir $DEMO/laptop/Box                # recent commits and the files they changed
-dl log -dir $DEMO/laptop/Box hello.txt      # history of one file
+dl log --dir $DEMO/laptop/Box                # recent commits and the files they changed
+dl log --dir $DEMO/laptop/Box hello.txt      # history of one file
 ```
 
 Restore an old version of a file with:
 
 ```sh
-dl restore -dir $DEMO/laptop/Box -rev <commit> hello.txt
+dl restore --dir $DEMO/laptop/Box --rev <commit> hello.txt
 ```
 
 The restore is itself a new change, so it syncs to the other devices and
@@ -253,7 +253,7 @@ the conflict. The daemon logs `SYNC PAUSED`, and with a desktop session
 you get a notification. Then check:
 
 ```sh
-dd status -short     # dropgitbox: CONFLICT Box
+dd status --short     # dropgitbox: CONFLICT Box
 dd status            # State: PAUSED: conflict in notes.txt, plus how to resolve
 cat $DEMO/desktop/Box/notes.txt
 ds list              # the server shows the desktop's conflict too
@@ -280,22 +280,24 @@ resolve it. The laptop and other devices carry on syncing as normal.
 
 ```sh
 # a) edit the file into what you want, then:
-dd resolve -dir $DEMO/desktop/Box
+dd resolve --dir $DEMO/desktop/Box
 
 # b) keep this device's version of every conflicted file:
-dd resolve -dir $DEMO/desktop/Box -ours
+dd resolve --dir $DEMO/desktop/Box --ours
 
 # c) keep the server's (the laptop's) version:
-dd resolve -dir $DEMO/desktop/Box -theirs
+dd resolve --dir $DEMO/desktop/Box --theirs
 ```
 
 With (a), `resolve` refuses while conflict markers are still in a file
-(`conflict markers still present in: notes.txt`). Add `-force` if they're
-meant to be there.
+(`notes.txt: still has conflict markers`). Add `--force` if they're meant
+to be there. To decide file by file, name the files:
+`dd resolve --dir $DEMO/desktop/Box --theirs notes.txt`. See
+[conflicts](conflicts.md#resolving-it).
 
 The resolution is committed and synced, the daemon emits `resolved` and
-resumes, and `status -short` returns to `dropgitbox: synced`. Both
-versions stay in history, so `dl log -dir $DEMO/laptop/Box notes.txt`
+resumes, and `status --short` returns to `dropgitbox: synced`. Both
+versions stay in history, so `dl log --dir $DEMO/laptop/Box notes.txt`
 shows them.
 
 ## 9. Notifications and hooks (optional)
@@ -341,7 +343,7 @@ real hook would normally use the default list, which is only the events
 worth telling someone about.
 
 A real hook would forward the event to your phone (ntfy, Pushover), a
-chat webhook, or a sound. The README's "Notifications and status" section
+chat webhook, or a sound. [Notifications and status](notifications.md#hook-command)
 lists every variable the hook gets.
 
 ## 10. Revoke a device
@@ -360,7 +362,7 @@ The token stops working immediately. Within about 25 seconds:
   confirm. The **server** terminal logs each rejection as
   `auth failed: invalid token`.
 - The desktop daemon emits `unauthorized`, once. Its log, `dd status
-  -short` (`dropgitbox: access denied Box`), the hook and a desktop
+  --short` (`dropgitbox: access denied Box`), the hook and a desktop
   notification all show it.
 
 The files already on the desktop stay put.
@@ -372,10 +374,10 @@ ds add desktop
 ```
 
 Stop the desktop daemon. Then run the following, pasting the new invite
-after `join -force`:
+after `join --force`:
 
 ```sh
-dd join -force dgb1.…new invite…
+dd join --force dgb1.…new invite…
 dd watch
 ```
 
@@ -395,10 +397,10 @@ Here's what you'll see:
 
 - The edit is committed locally right away. Nothing is lost.
 - Each failed sync emits `error`, and retries back off (5s, 10s, 20s, and
-  so on). `status -short` shows `retrying`.
+  so on). `status --short` shows `retrying`.
 - After 30 seconds of failing (your `offline_after`), the daemon emits
   `offline` once. That's a desktop notification and a hook run, and
-  `status -short` shows `offline`.
+  `status --short` shows `offline`.
 
 Start the server again with the same command as in step 3. To skip
 waiting for the next retry, run `dd sync`. It asks the running daemon to

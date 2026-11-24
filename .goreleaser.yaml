@@ -9,7 +9,9 @@ project_name: dropgitbox
 before:
   hooks:
     - go mod tidy
-    - go test ./...
+    # Man pages and shell completion scripts, generated from the commands.
+    # (Tests run in CI, which the release workflow runs before publishing.)
+    - go run ./internal/gendocs -version {{ .Version }} -date {{ .CommitDate }} build/docs
 
 builds:
   - id: dropgitbox
@@ -34,6 +36,12 @@ archives:
       - README.md
       - docs/*
       - packaging/**/*
+      - src: build/docs/man/*
+        dst: man
+        strip_parent: true
+      - src: build/docs/completions/*
+        dst: completions
+        strip_parent: true
 
 checksum:
   name_template: checksums.txt
@@ -66,10 +74,22 @@ nfpms:
           mode: 0644
       - src: packaging/config.example.toml
         dst: /usr/share/doc/dropgitbox/config.example.toml
-      - src: docs/deployment.md
-        dst: /usr/share/doc/dropgitbox/deployment.md
+      - src: docs/*.md
+        dst: /usr/share/doc/dropgitbox/
       - src: LICENSE
         dst: /usr/share/doc/dropgitbox/copyright
+      - src: build/docs/man/*
+        dst: /usr/share/man/man1/
+      - src: build/docs/completions/dropgitbox.bash
+        dst: /usr/share/bash-completion/completions/dropgitbox
+      - src: build/docs/completions/_dropgitbox
+        dst: /usr/share/zsh/vendor-completions/_dropgitbox
+        packager: deb
+      - src: build/docs/completions/_dropgitbox
+        dst: /usr/share/zsh/site-functions/_dropgitbox
+        packager: rpm
+      - src: build/docs/completions/dropgitbox.fish
+        dst: /usr/share/fish/vendor_completions.d/dropgitbox.fish
     scripts:
       postinstall: packaging/scripts/postinstall.sh
       preremove: packaging/scripts/preremove.sh

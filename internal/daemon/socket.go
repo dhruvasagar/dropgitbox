@@ -158,7 +158,7 @@ func (d *Daemon) serveSync(w http.ResponseWriter, r *http.Request) {
 		if folder != "" && f.Folder != folder {
 			continue
 		}
-		if f.State == StateConflict {
+		if f.State == StateConflict && d.stillConflicted(f.Folder) {
 			out = append(out, SyncOutcome{Folder: f.Folder, Result: "conflict",
 				Message: "paused on a conflict in: " + strings.Join(f.Conflicts, ", ")})
 			continue

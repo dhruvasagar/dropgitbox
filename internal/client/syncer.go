@@ -21,7 +21,7 @@ import (
 var ErrConflict = errors.New("unresolved merge conflict; syncing is paused until it is resolved")
 
 // ErrUnauthorized is returned when the server rejects this device's token.
-var ErrUnauthorized = errors.New("the server rejected this device's token (was the device revoked? get a new invite with `dropgitbox device add` and run `dropgitbox join -force`)")
+var ErrUnauthorized = errors.New("the server rejected this device's token (was the device revoked? get a new invite with `dropgitbox device add` and run `dropgitbox join --force`)")
 
 // network wraps errors from git commands that talk to the server, turning
 // authentication failures into ErrUnauthorized.

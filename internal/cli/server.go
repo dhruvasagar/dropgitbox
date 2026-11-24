@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"context"
@@ -14,6 +14,8 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+
+	"github.com/spf13/cobra"
 
 	"github.com/dhruvasagar/dropgitbox/internal/client"
 	"github.com/dhruvasagar/dropgitbox/internal/config"
@@ -33,41 +35,77 @@ type serverSettings struct {
 	trusted []netip.Prefix
 }
 
-func cmdServer(ctx context.Context, args []string) error {
-	fs, cfgPath := newFlags("server")
-	addr := fs.String("addr", "", `listen address (config: server.addr, default ":8080")`)
-	data := fs.String("data", "", "data directory (config: server.data_dir, default $XDG_DATA_HOME/dropgitbox)")
-	token := fs.String("token", "", "optional shared token accepted besides device tokens ($DROPGITBOX_TOKEN, config: server.token)")
-	noAuth := fs.Bool("no-auth", false, "disable authentication; trusted networks only (config: server.no_auth)")
-	tlsCert := fs.String("tls-cert", "", "serve HTTPS with this certificate (config: server.tls_cert)")
-	tlsKey := fs.String("tls-key", "", "private key for -tls-cert (config: server.tls_key)")
-	verbose := fs.Bool("v", false, "verbose logging")
-	parse(fs, args)
+func (a *app) serverCmd() *cobra.Command {
+	var (
+		addr, data, token, tlsCert, tlsKey string
+		noAuth, verbose                    bool
+	)
+	cmd := &cobra.Command{
+		Use:   "server",
+		Short: "Run the server",
+		Long: `Run the dropgitbox server in the foreground until interrupted. It is usually
+run as the dropgitbox-server system service instead:
 
-	st, err := loadServerSettings(*cfgPath, *data)
-	if err != nil {
-		return err
+  sudo systemctl enable --now dropgitbox-server
+
+The server stores one git repository per synced folder in its data
+directory, lets in only registered devices (see "dropgitbox device"), and
+tells connected devices when another device pushes, so they sync within
+seconds.
+
+Settings come from the [server] table in the config; flags override them.
+Set server.public_url to the URL devices use to reach the server, so
+"dropgitbox device add" can build invites. Exposed beyond a trusted network,
+serve HTTPS: with --tls-cert and --tls-key, or behind a reverse proxy (see
+docs/deployment.md).`,
+		Example: `  dropgitbox server --config /etc/dropgitbox/config.toml
+  dropgitbox server --addr 127.0.0.1:8080 --data ~/dropgitbox-data -v
+  dropgitbox server --addr :8443 --tls-cert cert.pem --tls-key key.pem`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			st, err := loadServerSettings(a.cfgPath, data)
+			if err != nil {
+				return err
+			}
+			f := cmd.Flags()
+			if f.Changed("addr") {
+				st.addr = addr
+			}
+			if f.Changed("token") {
+				st.token = token
+			}
+			if f.Changed("no-auth") {
+				st.noAuth = noAuth
+			}
+			if f.Changed("tls-cert") {
+				st.tlsCert = tlsCert
+			}
+			if f.Changed("tls-key") {
+				st.tlsKey = tlsKey
+			}
+			return runServer(cmd.Context(), st, verbose)
+		},
 	}
-	if isSet(fs, "addr") {
-		st.addr = *addr
-	}
-	if isSet(fs, "token") {
-		st.token = *token
-	}
-	if isSet(fs, "no-auth") {
-		st.noAuth = *noAuth
-	}
-	if isSet(fs, "tls-cert") {
-		st.tlsCert = *tlsCert
-	}
-	if isSet(fs, "tls-key") {
-		st.tlsKey = *tlsKey
-	}
+	f := cmd.Flags()
+	f.StringVar(&addr, "addr", "", "listen on `ADDR` (config: server.addr, default \":8080\")")
+	f.StringVar(&data, "data", "", "keep repositories and devices in `DIR` (config: server.data_dir, default $XDG_DATA_HOME/dropgitbox)")
+	f.StringVar(&token, "token", "", "also accept the shared `TOKEN` besides device tokens ($DROPGITBOX_TOKEN, config: server.token)")
+	f.BoolVar(&noAuth, "no-auth", false, "disable authentication; trusted networks only (config: server.no_auth)")
+	f.StringVar(&tlsCert, "tls-cert", "", "serve HTTPS with the certificate in `FILE` (config: server.tls_cert)")
+	f.StringVar(&tlsKey, "tls-key", "", "private key `FILE` for --tls-cert (config: server.tls_key)")
+	f.BoolVarP(&verbose, "verbose", "v", false, "log in more detail")
+	_ = cmd.MarkFlagDirname("data")
+	_ = cmd.MarkFlagFilename("tls-cert")
+	_ = cmd.MarkFlagFilename("tls-key")
+	return cmd
+}
+
+func runServer(ctx context.Context, st *serverSettings, verbose bool) error {
 	if (st.tlsCert == "") != (st.tlsKey == "") {
 		return errors.New("server: tls_cert and tls_key must be set together")
 	}
 
-	log := newLogger(*verbose)
+	log := newLogger(verbose)
 	srv, err := server.New(server.Options{
 		DataDir: st.dataDir, Token: st.token, NoAuth: st.noAuth, Logger: log, TrustedProxies: st.trusted,
 	})
@@ -82,7 +120,7 @@ func cmdServer(ctx context.Context, args []string) error {
 		log.Warn("no devices registered yet; add one with `dropgitbox device add NAME`")
 	}
 	if st.url == "" {
-		log.Warn("server.public_url is not set: `dropgitbox device add` needs it to build invites (or pass -url each time)",
+		log.Warn("server.public_url is not set: `dropgitbox device add` needs it to build invites (or pass --url each time)",
 			"config", configHint(st.cfg))
 	} else if err := client.ValidServerURL(st.url); err != nil {
 		log.Warn("server.public_url is invalid; invites will be rejected until it is fixed", "err", err)
@@ -175,106 +213,187 @@ func loadServerSettings(cfgPath, dataFlag string) (*serverSettings, error) {
 	return st, nil
 }
 
-func cmdDevice(ctx context.Context, args []string) error {
-	const help = `usage:
-  dropgitbox device add NAME [-url URL]   register a device and print its invite
-  dropgitbox device list                  list devices with last activity and sync status
-  dropgitbox device show NAME             per-folder detail for one device
-  dropgitbox device rotate NAME [-url URL] replace a device's token (prints a new invite)
-  dropgitbox device revoke NAME           revoke a device's access immediately
+func (a *app) deviceCmd() *cobra.Command {
+	var data string
+	cmd := groupCmd(&cobra.Command{
+		Use:   "device",
+		Short: "Manage the devices allowed to sync",
+		Long: `Register, inspect and revoke the devices allowed to sync with this server.
 
-Run these on the server node, as the server's user or with sudo.`
-	// Flags may come before or after the subcommand.
-	fs, cfgPath := newFlags("device")
-	data := fs.String("data", "", "server data directory (config: server.data_dir)")
-	pubURL := fs.String("url", "", "URL devices use to reach the server (config: server.public_url)")
-	pos := parse(fs, args)
-	if len(pos) == 0 {
-		return errors.New(help)
-	}
-	sub, pos := pos[0], pos[1:]
+Run these on the server node, as the server's user or with sudo: they work
+on the server's data directory directly, and take effect on the running
+server immediately.`,
+		Example: `  sudo dropgitbox device add laptop
+  sudo dropgitbox device list
+  sudo dropgitbox device revoke old-phone`,
+	})
+	cmd.PersistentFlags().StringVar(&data, "data", "", "the server's data directory `DIR` (config: server.data_dir)")
+	_ = cmd.MarkPersistentFlagDirname("data")
 
-	st, err := loadServerSettings(*cfgPath, *data)
-	if err != nil {
-		return err
-	}
-	if isSet(fs, "url") {
-		st.url = *pubURL
-	}
-	oneName := func(usage string) (string, error) {
-		if len(pos) != 1 {
-			return "", errors.New("usage: dropgitbox device " + usage)
+	settings := func() (*serverSettings, error) { return loadServerSettings(a.cfgPath, data) }
+	names := a.completeDevices(&data)
+
+	// add and rotate print an invite, which needs the server's public URL.
+	var pubURL string
+	inviteSettings := func(cmd *cobra.Command) (*serverSettings, error) {
+		st, err := settings()
+		if err != nil {
+			return nil, err
 		}
-		return pos[0], nil
-	}
-	needURL := func() error {
+		if cmd.Flags().Changed("url") {
+			st.url = pubURL
+		}
 		if st.url == "" {
-			return errors.New("the server's public URL is unknown; pass -url https://box.example.com or set server.public_url in " + configHint(st.cfg))
+			return nil, errors.New("the server's public URL is unknown; pass --url https://box.example.com or set server.public_url in " + configHint(st.cfg))
 		}
 		if err := client.ValidServerURL(st.url); err != nil {
-			return fmt.Errorf("invalid server URL (-url or server.public_url): %w", err)
+			return nil, fmt.Errorf("invalid server URL (--url or server.public_url): %w", err)
 		}
-		return nil
+		return st, nil
+	}
+	urlFlag := func(c *cobra.Command) *cobra.Command {
+		c.Flags().StringVar(&pubURL, "url", "", "put `URL` in the invite as the server's address (config: server.public_url)")
+		return c
 	}
 
-	switch sub {
-	case "add":
-		name, err := oneName("add NAME [-url URL]")
-		if err != nil {
-			return err
-		}
-		if err := needURL(); err != nil {
-			return err
-		}
-		token, err := server.AddDevice(st.dataDir, name)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("Registered device %q.\n\n", name)
-		printInvite(st.url, token, name)
-		checkReachable(ctx, st.url)
-		return nil
+	cmd.AddCommand(
+		urlFlag(&cobra.Command{
+			Use:   "add NAME",
+			Short: "Register a device and print its invite",
+			Long: `Register a new device called NAME and print an invite for it. On that
+device, run "dropgitbox join INVITE".
 
-	case "rotate":
-		name, err := oneName("rotate NAME [-url URL]")
-		if err != nil {
-			return err
-		}
-		if err := needURL(); err != nil {
-			return err
-		}
-		token, err := server.RotateDevice(st.dataDir, name)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("Issued a new token for %q; the old one no longer works.\n\n", name)
-		printInvite(st.url, token, name)
-		fmt.Println("(On that device run the join command with -force to replace the old token. Its folders stay as they are.)")
-		checkReachable(ctx, st.url)
-		return nil
+The invite holds the server's URL (server.public_url, or --url) and the
+device's new access token, so send it over a private channel. add then
+checks that the URL answers as a dropgitbox server from here, and warns if
+it doesn't.`,
+			Example: `  dropgitbox device add laptop
+  dropgitbox device add phone --url https://box.example.com`,
+			Args: argsRange(1, 1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				st, err := inviteSettings(cmd)
+				if err != nil {
+					return err
+				}
+				name := args[0]
+				token, err := server.AddDevice(st.dataDir, name)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("Registered device %q.\n\n", name)
+				printInvite(st.url, token, name)
+				checkReachable(cmd.Context(), st.url)
+				return nil
+			},
+		}),
+		&cobra.Command{
+			Use:     "list",
+			Aliases: []string{"ls"},
+			Short:   "List devices and their sync status",
+			Long: `List the registered devices: when each was last seen and last pushed, its
+sync status across its folders (in sync, behind, CONFLICT, ERROR), and the
+dropgitbox version it runs.`,
+			Example: `  dropgitbox device list`,
+			Args:    cobra.NoArgs,
+			RunE: func(cmd *cobra.Command, _ []string) error {
+				st, err := settings()
+				if err != nil {
+					return err
+				}
+				return listDevices(cmd.Context(), st)
+			},
+		},
+		&cobra.Command{
+			Use:   "show NAME",
+			Short: "Show one device's folders in detail",
+			Long: `Show device NAME in detail: when it was added and last seen, from which
+address, and for each of its folders the state it last reported, when it
+last fetched and pushed, and whether it has the server's latest commit.`,
+			Example:           `  dropgitbox device show laptop`,
+			Args:              argsRange(1, 1),
+			ValidArgsFunction: names,
+			RunE: func(cmd *cobra.Command, args []string) error {
+				st, err := settings()
+				if err != nil {
+					return err
+				}
+				return showDevice(cmd.Context(), st, args[0])
+			},
+		},
+		urlFlag(&cobra.Command{
+			Use:   "rotate NAME",
+			Short: "Replace a device's token",
+			Long: `Issue a new access token for device NAME and print a new invite. The old
+token stops working immediately.
 
-	case "list", "ls":
-		return listDevices(ctx, st)
+On that device, run "dropgitbox join --force INVITE" to switch to the new
+token. Its folders stay as they are.`,
+			Example:           `  dropgitbox device rotate laptop`,
+			Args:              argsRange(1, 1),
+			ValidArgsFunction: names,
+			RunE: func(cmd *cobra.Command, args []string) error {
+				st, err := inviteSettings(cmd)
+				if err != nil {
+					return err
+				}
+				name := args[0]
+				token, err := server.RotateDevice(st.dataDir, name)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("Issued a new token for %q; the old one no longer works.\n\n", name)
+				printInvite(st.url, token, name)
+				fmt.Println("(On that device run the join command with --force to replace the old token. Its folders stay as they are.)")
+				checkReachable(cmd.Context(), st.url)
+				return nil
+			},
+		}),
+		&cobra.Command{
+			Use:     "revoke NAME",
+			Aliases: []string{"remove", "rm"},
+			Short:   "Revoke a device's access",
+			Long: `Revoke device NAME's access immediately: its token stops working and its
+open connections are closed. The files already on that device stay there.`,
+			Example:           `  dropgitbox device revoke old-phone`,
+			Args:              argsRange(1, 1),
+			ValidArgsFunction: names,
+			RunE: func(_ *cobra.Command, args []string) error {
+				st, err := settings()
+				if err != nil {
+					return err
+				}
+				name := args[0]
+				if err := server.RevokeDevice(st.dataDir, name); err != nil {
+					return err
+				}
+				fmt.Printf("Revoked %q. Its token no longer works and its open connections are closed;\nthe files already on that device stay there.\n", name)
+				return nil
+			},
+		},
+	)
+	return cmd
+}
 
-	case "show":
-		name, err := oneName("show NAME")
+// completeDevices offers the registered device names.
+func (a *app) completeDevices(data *string) cobra.CompletionFunc {
+	return func(_ *cobra.Command, args []string, _ string) ([]string, cobra.ShellCompDirective) {
+		if len(args) > 0 {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+		st, err := loadServerSettings(a.cfgPath, *data)
 		if err != nil {
-			return err
+			return nil, cobra.ShellCompDirectiveNoFileComp
 		}
-		return showDevice(ctx, st, name)
-
-	case "revoke", "remove", "rm":
-		name, err := oneName("revoke NAME")
+		devices, err := server.ListDevices(st.dataDir)
 		if err != nil {
-			return err
+			return nil, cobra.ShellCompDirectiveNoFileComp
 		}
-		if err := server.RevokeDevice(st.dataDir, name); err != nil {
-			return err
+		names := make([]string, len(devices))
+		for i, d := range devices {
+			names[i] = d.Name
 		}
-		fmt.Printf("Revoked %q. Its token no longer works and its open connections are closed;\nthe files already on that device stay there.\n", name)
-		return nil
+		return names, cobra.ShellCompDirectiveNoFileComp
 	}
-	return fmt.Errorf("unknown device command %q\n\n%s", sub, help)
 }
 
 // checkReachable warns, without failing, when the invite's URL does not
@@ -287,7 +406,7 @@ func checkReachable(ctx context.Context, serverURL string) {
 	u := strings.TrimRight(serverURL, "/") + "/healthz"
 	warn := func(format string, a ...any) {
 		fmt.Fprintf(os.Stderr, "\nWarning: "+format+"\n", a...)
-		fmt.Fprintln(os.Stderr, "The invite was still created. If the URL is wrong, fix server.public_url (or -url) and run `dropgitbox device rotate NAME`.")
+		fmt.Fprintln(os.Stderr, "The invite was still created. If the URL is wrong, fix server.public_url (or --url) and run `dropgitbox device rotate NAME`.")
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {

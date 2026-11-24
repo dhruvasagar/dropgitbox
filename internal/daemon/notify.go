@@ -137,7 +137,7 @@ func Describe(ev client.Event) (title, body string, urgent bool) {
 	switch ev.Type {
 	case client.EventConflict:
 		return fmt.Sprintf("%s: sync paused, conflict", name),
-			fmt.Sprintf("Conflicting changes in %s.\nEdit them, then run: dropgitbox resolve -dir %s", files(5), ev.Folder), true
+			fmt.Sprintf("Conflicting changes in %s.\nEdit them, then run: dropgitbox resolve --dir %s", files(5), ev.Folder), true
 	case client.EventResolved:
 		return fmt.Sprintf("%s: conflict resolved", name), "Syncing has resumed.", false
 	case client.EventOffline:
@@ -146,7 +146,7 @@ func Describe(ev client.Event) (title, body string, urgent bool) {
 		return fmt.Sprintf("%s: syncing again", name), "The connection to the server is working again.", false
 	case client.EventUnauthorized:
 		return fmt.Sprintf("%s: access denied", name),
-			"The server rejected this device's token. Ask for a new invite and run `dropgitbox join -force`.", true
+			"The server rejected this device's token. Ask for a new invite and run `dropgitbox join --force`.", true
 	case client.EventRemoteChanges:
 		return fmt.Sprintf("%s: %d file(s) updated", name, ev.Pulled), files(5), false
 	case client.EventSynced:

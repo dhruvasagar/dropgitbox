@@ -166,6 +166,17 @@ curl -fsSL https://raw.githubusercontent.com/dhruvasagar/dropgitbox/main/install
   | sudo sh -s -- --server --public-url https://box.example.com
 ```
 
+`install.sh` verifies the release checksum before installing, and puts the
+`dropgitbox(1)` man page next to the binary. Its options:
+
+| Option | Effect |
+| --- | --- |
+| `--server [--public-url URL]` | Set up this machine as a server node (Linux with systemd, as root) |
+| `--service` | Install and start the per-user sync daemon on a device: a systemd user unit on Linux, a launchd agent on macOS |
+| `--version vX.Y.Z` | Install a specific release |
+| `--bin-dir DIR` | Install the binary somewhere else (default: `/usr/local/bin` as root, `~/.local/bin` otherwise) |
+| `--man-dir DIR` | Install the man page somewhere else (default: `share/man/man1` beside the binary's directory) |
+
 With a package, set `public_url` in `/etc/dropgitbox/config.toml`, then:
 
 ```sh
@@ -180,52 +191,21 @@ up the server, back up that directory.
 
 ## 3. Add devices
 
-Every device gets its own token, so a lost laptop can be revoked without
-touching the others. On the server:
-
-```console
-$ sudo dropgitbox device add laptop
-Registered device "laptop".
-
-On that device, install dropgitbox and run:
-
-  dropgitbox join dgb1.eyJzZXJ2ZXIiOiJodHRwczovL2JveC5leGFtcGxlLmNvbSIs...
-```
-
-The invite contains the server URL, the device name, and the device's
-token. **Treat it like a password** and send it over a private channel.
-On the new device:
+On the server, register each device and send it its invite privately:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/dhruvasagar/dropgitbox/main/install.sh | sh
-dropgitbox join dgb1.eyJ...          # writes ~/.config/dropgitbox/{config.toml,token}
-dropgitbox repos                     # what is on the server
-dropgitbox setup -repo docs -dir ~/Box
-systemctl --user enable --now dropgitbox   # or: install.sh --service (Linux & macOS)
+sudo dropgitbox device add laptop
 ```
 
-Shortcut for your second, third, ... device: copy the `[[folders]]` list
-from an existing device's `~/.config/dropgitbox/config.toml` (it is
-dotfiles-friendly: no secrets, and paths use `~`). On the new device, run
-`join` and then `dropgitbox watch`, which sets up every listed folder.
-
-Manage devices on the server:
-
-```sh
-sudo dropgitbox device list              # last seen, last push, sync status, version
-sudo dropgitbox device show laptop       # per-folder detail: state, conflicts, last error
-sudo dropgitbox device rotate laptop     # new token and invite; the old one stops working
-sudo dropgitbox device revoke laptop     # takes effect immediately, no restart
-```
-
-Revoking stops a device from syncing. It does not erase the copy already on
-that device.
+On the device, install dropgitbox, then `dropgitbox join` with the invite,
+`dropgitbox setup` for each folder, and enable the sync daemon. See
+[using a device](devices.md), and [running the server](server.md#managing-devices)
+for listing, rotating and revoking devices.
 
 ## 4. Hardening a public server
 
 dropgitbox already rejects requests without a valid token and blocks
-clients that keep presenting bad ones (see the Security section of the
-README). On a public server, also do the following.
+clients that keep presenting bad ones (see [security](security.md)). On a public server, also do the following.
 
 **Make sure the server sees real client addresses.** With the proxy on
 the same machine and dropgitbox on `127.0.0.1`, the defaults are correct.
@@ -278,29 +258,13 @@ port     = http,https
 
 **Keep tokens tight.** Give every device its own token
 (`dropgitbox device add`). Rotate one you suspect has leaked
-(`dropgitbox device rotate NAME`, then `join -force` on the device), and
+(`dropgitbox device rotate NAME`, then `join --force` on the device), and
 revoke lost devices (`dropgitbox device revoke NAME`). Check
 `dropgitbox device list` now and then for devices you don't recognise or
 that have gone quiet.
 
 ## 5. Operations
 
-- **Device health.** `sudo dropgitbox device list` shows each device's last
-  contact, last push, client version, and whether it is in sync, paused on
-  a conflict, or failing. `sudo dropgitbox device show NAME` has the
-  per-folder detail.
-- **Logs.** Server: `journalctl -u dropgitbox-server`. Client:
-  `journalctl --user -u dropgitbox` on Linux, `~/Library/Logs/dropgitbox.log`
-  on macOS.
-- **Conflicts.** The client daemon pauses that folder and sends a desktop
-  notification, and the hook if you configured one. Run `dropgitbox status`,
-  then `dropgitbox resolve`. The server also shows the conflict in
-  `dropgitbox device list`.
-- **Watching devices.** On each device, `dropgitbox status -short` fits a
-  status bar, and `dropgitbox events` streams what the daemon does. See
-  "Notifications and status" in the README.
-- **Headless clients.** On a machine nobody logs into, run
-  `sudo loginctl enable-linger $USER` so the user service keeps running.
-- **Upgrades.** Install the new package, or re-run `install.sh`, then
-  restart the services. Devices and the server can be upgraded
-  independently.
+Backups, monitoring, upgrades and device management are covered in
+[running the server](server.md). On the devices, see
+[using a device](devices.md) and [notifications and status](notifications.md).

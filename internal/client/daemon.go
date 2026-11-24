@@ -189,15 +189,19 @@ func (s *Syncer) Watch(ctx context.Context, opts DaemonOptions) error {
 
 		case <-pauseCheck.C:
 			if paused && !s.Conflicted() {
-				paused = false
-				s.log.Info("conflict resolved; resuming sync")
-				emit(Event{Type: EventResolved, Message: "Conflict resolved; syncing resumed."})
 				trigger()
 			}
 
 		case <-kick:
 			if paused {
-				continue // already reported; stay quiet until resolved
+				if s.Conflicted() {
+					continue // already reported; stay quiet until resolved
+				}
+				// Concluded by `dropgitbox resolve` (or plain git): resume
+				// at once, whether noticed by the check or asked to sync.
+				paused = false
+				s.log.Info("conflict resolved; resuming sync")
+				emit(Event{Type: EventResolved, Message: "Conflict resolved; syncing resumed."})
 			}
 			emit(Event{Type: EventSyncing})
 			syncing.Store(true)
@@ -264,5 +268,5 @@ func (s *Syncer) reportConflict(ctx context.Context, emit func(Event)) {
 	s.log.Warn("SYNC PAUSED: merge conflict needs your attention. Edit the files (or pick a side), then run `dropgitbox resolve`.",
 		"files", files)
 	emit(Event{Type: EventConflict, Files: files,
-		Message: fmt.Sprintf("Sync paused: edit the conflicted files, then run `dropgitbox resolve -dir %s`.", s.cfg.Dir)})
+		Message: fmt.Sprintf("Sync paused: edit the conflicted files, then run `dropgitbox resolve --dir %s`.", s.cfg.Dir)})
 }

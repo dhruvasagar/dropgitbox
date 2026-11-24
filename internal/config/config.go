@@ -2,7 +2,7 @@
 //
 // The file is looked up following the XDG Base Directory spec:
 //
-//  1. the -config flag, or $DROPGITBOX_CONFIG
+//  1. the --config flag, or $DROPGITBOX_CONFIG
 //  2. $XDG_CONFIG_HOME/dropgitbox/config.toml (default ~/.config/...)
 //  3. each $XDG_CONFIG_DIRS entry (default /etc/xdg)/dropgitbox/config.toml
 //  4. /etc/dropgitbox/config.toml (used by the packaged server)
@@ -50,7 +50,7 @@ type Config struct {
 	Notify  Notify   `toml:"notify"`
 
 	path     string   // file this was loaded from ("" when none was found)
-	explicit bool     // path came from -config / $DROPGITBOX_CONFIG
+	explicit bool     // path came from --config / $DROPGITBOX_CONFIG
 	warnings []string // non-fatal problems found while loading
 }
 
@@ -199,7 +199,7 @@ func SearchPaths() []string {
 	return append(paths, SystemPath)
 }
 
-// Load finds and parses the config file. explicit is the -config flag
+// Load finds and parses the config file. explicit is the --config flag
 // value ("" if unset). A missing implicit config is not an error: an empty
 // Config is returned. Unknown keys are rejected, since they are almost
 // always typos.
